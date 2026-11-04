@@ -2,8 +2,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-// The type-checking on curl_easy_setopt and similar expands to huge macros which times out the analyzer,
-// messes up the syntax highlighting, and somehow started randomly deleting and moving lines of code?
+// The type-checking on curl_easy_setopt and similar expands to huge macros
+// which times out the analyzer, messes up the syntax highlighting, and somehow
+// started randomly deleting and moving lines of code?
 #ifdef __CLION_IDE__
 #define CURL_DISABLE_TYPECHECK
 #endif
@@ -28,10 +29,10 @@ typedef int64_t i64;
 #define LOG_INFO(fmt, ...) fprintf(stderr, "[INFO] %s:%d: " fmt "\n", __FILE_NAME__, __LINE__, ##__VA_ARGS__)
 #define LOG_ERROR(fmt, ...) fprintf(stderr, "[ERROR] %s:%d: " fmt "\n", __FILE_NAME__, __LINE__, ##__VA_ARGS__)
 
-#define FATAL_ERROR(fmt, ...)                                                                                          \
-    do {                                                                                                               \
-        LOG_ERROR(fmt, ##__VA_ARGS__);                                                                                 \
-        exit(1);                                                                                                       \
+#define FATAL_ERROR(fmt, ...)          \
+    do {                               \
+        LOG_ERROR(fmt, ##__VA_ARGS__); \
+        exit(1);                       \
     } while (0)
 
 static const char *REQUEST_ID_HEADER_NAME = "Lambda-Runtime-Aws-Request-Id";
@@ -48,7 +49,8 @@ static const char *DYNAMODB_QUERY = X_AMZ_TARGET_DYNAMODB "Query";
 
 static const char *ACCESS_DENIED_RESPONSE = STR({"statusCode" : 403, "body" : "Access denied"});
 
-// TODO encode in HTML <link rel="icon" href="data:image/x-icon;base64,AAABAAEAEBAAAAAAAABoBQAAF/QA6OjoAKysrABwcH"/>
+// TODO encode in HTML <link rel="icon"
+// href="data:image/x-icon;base64,AAABAAEAEBAAAAAAAABoBQAAF/QA6OjoAKysrABwcH"/>
 static const char *FAVICON = STR({
     "statusCode" : 200,
     "body" : "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"12\" height=\"12\">"
@@ -59,8 +61,7 @@ static const char *FAVICON = STR({
 
 static const char *get_env_or_fatal(const char *name) {
     const char *value = getenv(name);
-    if (!value)
-        FATAL_ERROR("Missing env var: %s", name);
+    if (!value) FATAL_ERROR("Missing env var: %s", name);
     return value;
 }
 
@@ -73,10 +74,10 @@ typedef struct {
 
 static Env load_env_vars() {
     return (Env) {
-            get_env_or_fatal("AWS_ACCESS_KEY_ID"),
-            get_env_or_fatal("AWS_SECRET_ACCESS_KEY"),
-            get_env_or_fatal("AWS_SESSION_TOKEN"),
-            get_env_or_fatal("API_KEY"),
+        get_env_or_fatal("AWS_ACCESS_KEY_ID"),
+        get_env_or_fatal("AWS_SECRET_ACCESS_KEY"),
+        get_env_or_fatal("AWS_SESSION_TOKEN"),
+        get_env_or_fatal("API_KEY"),
     };
 }
 
@@ -89,8 +90,8 @@ typedef struct {
 typedef struct {
     CURL *handle;
     CurlResponse *response_data;
-    char *userpwd; // AWS_ACCESS_KEY_ID:AWS_SECRET_ACCESS_KEY
-    char *session_token_header; // x-amz-security-token: AWS_SESSION_TOKEN
+    char *userpwd;               // AWS_ACCESS_KEY_ID:AWS_SECRET_ACCESS_KEY
+    char *session_token_header;  // x-amz-security-token: AWS_SESSION_TOKEN
 } HttpClient;
 
 static size_t curl_write_fixed_buffer_callback(const char *ptr, const size_t size, const size_t nmemb, void *userdata) {
@@ -115,8 +116,7 @@ static size_t curl_write_fixed_buffer_callback(const char *ptr, const size_t siz
 #ifdef CURL_DEBUG
 static int curl_print_debug_callback(CURL *handle, curl_infotype type, char *data, const size_t size, void *userdata) {
     int print_size = (int) size;
-    if (size > 0 && data[size - 1] == '\n')
-        print_size--;
+    if (size > 0 && data[size - 1] == '\n') print_size--;
     LOG_DEBUG("CURL: %.*s", (int) print_size, data);
     return 0;
 }
@@ -131,7 +131,7 @@ void curl_set_default_options(const HttpClient *client) {
     curl_easy_setopt(client->handle, CURLOPT_WRITEDATA, client->response_data);
     curl_easy_setopt(client->handle, CURLOPT_WRITEFUNCTION, curl_write_fixed_buffer_callback);
 
-    client->response_data->length = 0; // Reset response buffer
+    client->response_data->length = 0;  // Reset response buffer
 
 #ifdef CURL_DEBUG
     curl_easy_setopt(client->handle, CURLOPT_VERBOSE, 1L);
@@ -149,15 +149,15 @@ void curl_set_aws_options(const HttpClient *client, struct curl_slist *headers) 
     curl_easy_setopt(client->handle, CURLOPT_HTTPHEADER, headers);
 }
 
-// The memory for the returned struct is associated with the easy handle and subsequent calls to curl_easy_header
-// clobber the struct used in the previous calls for the same easy handle.
+// The memory for the returned struct is associated with the easy handle and
+// subsequent calls to curl_easy_header clobber the struct used in the previous
+// calls for the same easy handle.
 char *get_response_header(const HttpClient *client, const char *name) {
     struct curl_header *header;
     const CURLHcode code = curl_easy_header(client->handle, name, 0, CURLH_HEADER, -1, &header);
 
-    if (code != CURLHE_OK) {
-        FATAL_ERROR("Failed to get %s header with code %d", name, code);
-    }
+    if (code != CURLHE_OK) FATAL_ERROR("Failed to get %s header with code %d", name, code);
+
     return header->value;
 }
 
@@ -272,9 +272,7 @@ int main(int argc, char *argv[]) {
         LOG_INFO("GET from %s", next_api_url);
         const int next_api_code = perform_http(&client, NULL, "");
 
-        if (next_api_code >= 400) {
-            FATAL_ERROR("Failed to get next invocation with code %d", next_api_code);
-        }
+        if (next_api_code >= 400) FATAL_ERROR("Failed to get next invocation with code %d", next_api_code);
 
         char request_id[64];
         strcpy(request_id, get_response_header(&client, REQUEST_ID_HEADER_NAME));
@@ -287,7 +285,7 @@ int main(int argc, char *argv[]) {
 
         char response_data[256];
 
-        event_data[client.response_data->length] = 0; // Add null-terminator for strstr
+        event_data[client.response_data->length] = 0;  // Add null-terminator for strstr
         if (strstr(event_data, "/favicon.ico")) {
             strcpy(response_data, FAVICON);
         } else if (!strstr(event_data, env.api_key)) {
