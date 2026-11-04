@@ -28,7 +28,11 @@ typedef int64_t i64;
 #define LOG_INFO(fmt, ...) fprintf(stderr, "[INFO] %s:%d: " fmt "\n", __FILE_NAME__, __LINE__, ##__VA_ARGS__)
 #define LOG_ERROR(fmt, ...) fprintf(stderr, "[ERROR] %s:%d: " fmt "\n", __FILE_NAME__, __LINE__, ##__VA_ARGS__)
 
-#define FATAL_ERROR(fmt, ...) do { LOG_ERROR(fmt, ##__VA_ARGS__); exit(1); } while(0)
+#define FATAL_ERROR(fmt, ...)                                                                                          \
+    do {                                                                                                               \
+        LOG_ERROR(fmt, ##__VA_ARGS__);                                                                                 \
+        exit(1);                                                                                                       \
+    } while (0)
 
 static const char *REQUEST_ID_HEADER_NAME = "Lambda-Runtime-Aws-Request-Id";
 static const char *INVOCATION_ID_HEADER_NAME = "Lambda-Runtime-Invocation-Id";
@@ -36,25 +40,27 @@ static const char *INVOCATION_ID_HEADER_NAME = "Lambda-Runtime-Invocation-Id";
 static const char *CONTENT_TYPE_JSON_HEADER = "Content-Type: application/x-amz-json-1.0";
 
 #define AWS_REGION "eu-west-1"
-static const char *DYNAMODB_ENDPOINT = "https://dynamodb."AWS_REGION".amazonaws.com";
+static const char *DYNAMODB_ENDPOINT = "https://dynamodb." AWS_REGION ".amazonaws.com";
 
 #define X_AMZ_TARGET_PREFIX "X-Amz-Target: "
-#define X_AMZ_TARGET_DYNAMODB X_AMZ_TARGET_PREFIX"DynamoDB_20120810."
-static const char *DYNAMODB_QUERY = X_AMZ_TARGET_DYNAMODB"Query";
+#define X_AMZ_TARGET_DYNAMODB X_AMZ_TARGET_PREFIX "DynamoDB_20120810."
+static const char *DYNAMODB_QUERY = X_AMZ_TARGET_DYNAMODB "Query";
 
-static const char *ACCESS_DENIED_RESPONSE = STR({"statusCode": 403, "body": "Access denied"});
-// TODO encode in HTML like <link rel="icon" href="data:image/x-icon;base64,AAABAAEAEBAAAAAAAABoBQAAF/QA6OjoAKysrABwcH" />
-static const char *FAVICON = STR(
-    {
-    "statusCode": 200,
-    "body": "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"12\" height=\"12\"><text x=\"0\" y=\"10\" font-size=\"12\">気</text></svg>",
-    "headers": {"content-type": "image/svg+xml"}
-    }
-);
+static const char *ACCESS_DENIED_RESPONSE = STR({"statusCode" : 403, "body" : "Access denied"});
+
+// TODO encode in HTML <link rel="icon" href="data:image/x-icon;base64,AAABAAEAEBAAAAAAAABoBQAAF/QA6OjoAKysrABwcH"/>
+static const char *FAVICON = STR({
+    "statusCode" : 200,
+    "body" : "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"12\" height=\"12\">"
+             "<text x=\"0\" y=\"10\" font-size=\"12\">気</text>"
+             "</svg>",
+    "headers" : {"content-type" : "image/svg+xml"}
+});
 
 static const char *get_env_or_fatal(const char *name) {
     const char *value = getenv(name);
-    if (!value) FATAL_ERROR("Missing env var: %s", name);
+    if (!value)
+        FATAL_ERROR("Missing env var: %s", name);
     return value;
 }
 
@@ -66,11 +72,11 @@ typedef struct {
 } Env;
 
 static Env load_env_vars() {
-    return (Env){
-        get_env_or_fatal("AWS_ACCESS_KEY_ID"),
-        get_env_or_fatal("AWS_SECRET_ACCESS_KEY"),
-        get_env_or_fatal("AWS_SESSION_TOKEN"),
-        get_env_or_fatal("API_KEY"),
+    return (Env) {
+            get_env_or_fatal("AWS_ACCESS_KEY_ID"),
+            get_env_or_fatal("AWS_SECRET_ACCESS_KEY"),
+            get_env_or_fatal("AWS_SESSION_TOKEN"),
+            get_env_or_fatal("API_KEY"),
     };
 }
 
@@ -109,7 +115,8 @@ static size_t curl_write_fixed_buffer_callback(const char *ptr, const size_t siz
 #ifdef CURL_DEBUG
 static int curl_print_debug_callback(CURL *handle, curl_infotype type, char *data, const size_t size, void *userdata) {
     int print_size = (int) size;
-    if (size > 0 && data[size - 1] == '\n') print_size--;
+    if (size > 0 && data[size - 1] == '\n')
+        print_size--;
     LOG_DEBUG("CURL: %.*s", (int) print_size, data);
     return 0;
 }
@@ -142,12 +149,11 @@ void curl_set_aws_options(const HttpClient *client, struct curl_slist *headers) 
     curl_easy_setopt(client->handle, CURLOPT_HTTPHEADER, headers);
 }
 
-// The memory for the returned struct is associated with the easy handle and subsequent calls to curl_easy_header clobber the struct used in the previous calls for the same easy handle.
+// The memory for the returned struct is associated with the easy handle and subsequent calls to curl_easy_header
+// clobber the struct used in the previous calls for the same easy handle.
 char *get_response_header(const HttpClient *client, const char *name) {
     struct curl_header *header;
-    const CURLHcode code = curl_easy_header(
-        client->handle, name, 0, CURLH_HEADER, -1, &header
-    );
+    const CURLHcode code = curl_easy_header(client->handle, name, 0, CURLH_HEADER, -1, &header);
 
     if (code != CURLHE_OK) {
         FATAL_ERROR("Failed to get %s header with code %d", name, code);
@@ -159,18 +165,14 @@ HttpClient init_http_client(const Env *env, const size_t response_data_buffer_si
     CURL *handle = curl_easy_init();
 
     CurlResponse *curl_response = malloc(sizeof(*curl_response));
-    *curl_response = (CurlResponse){
-        .data = malloc(response_data_buffer_size + 1),
-        .length = 0,
-        .capacity = response_data_buffer_size
-    };
+    *curl_response = (CurlResponse) {malloc(response_data_buffer_size + 1), 0, response_data_buffer_size};
 
     char *userpwd;
     asprintf(&userpwd, "%s:%s", env->access_key_id, env->secret_access_key);
 
     char *session_token_header = NULL;
     asprintf(&session_token_header, "x-amz-security-token: %s", env->session_token);
-    return (HttpClient){handle, curl_response, userpwd, session_token_header};
+    return (HttpClient) {handle, curl_response, userpwd, session_token_header};
 }
 
 int perform_http(const HttpClient *client, struct curl_slist *headers, const char *name_for_log) {
@@ -214,15 +216,13 @@ typedef struct {
 } Measurement;
 
 int query(const HttpClient *client, Measurement *measurement) {
-    // @formatter:off
     char *input = STR({
-        "TableName": "MeasurementsTable",
-        "Limit": 1,
-        "KeyConditionExpression": "device_id = :d",
-        "ExpressionAttributeValues": {":d": {"S": "picotherm/1"}},
-        "ScanIndexForward": false
+        "TableName" : "MeasurementsTable",
+        "Limit" : 1,
+        "KeyConditionExpression" : "device_id = :d",
+        "ExpressionAttributeValues" : {":d" : {"S" : "picotherm/1"}},
+        "ScanIndexForward" : false
     });
-    // @formatter:on
 
     const int code = perform_dynamodb(client, DYNAMODB_QUERY, "Test Query", input);
     const CurlResponse response = *client->response_data;
@@ -296,8 +296,7 @@ int main(int argc, char *argv[]) {
             Measurement measurement;
             query(&client, &measurement);
 
-            snprintf(response_data, sizeof(response_data),
-                     STR({"humidity": "%.1f", "temperature": "%.1f"}),
+            snprintf(response_data, sizeof(response_data), STR({"humidity" : "%.1f", "temperature" : "%.1f"}),
                      measurement.humidity, measurement.temperature);
         }
 
@@ -305,9 +304,8 @@ int main(int argc, char *argv[]) {
         curl_easy_setopt(client.handle, CURLOPT_POSTFIELDS, response_data);
 
         char *response_url;
-        asprintf(
-            &response_url, "http://%s/2018-06-01/runtime/invocation/%s/response", lambda_runtime_endpoint, request_id
-        );
+        asprintf(&response_url, "http://%s/2018-06-01/runtime/invocation/%s/response", lambda_runtime_endpoint,
+                 request_id);
         curl_easy_setopt(client.handle, CURLOPT_URL, response_url);
 
         char invocation_id_header[100];
