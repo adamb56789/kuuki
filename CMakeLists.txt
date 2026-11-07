@@ -3,6 +3,8 @@ project(kuuki C)
 
 set(CMAKE_C_STANDARD 11)
 
+add_executable(json json.c)
+
 add_executable(get_latest_data get_latest_data.c)
 
 find_package(CURL REQUIRED)
@@ -19,18 +21,10 @@ function(package_lambda target)
             TARGET ${target}
             POST_BUILD
 
-            COMMAND ${CMAKE_COMMAND} -E make_directory
-            "${package_dir}"
-
-            COMMAND ${CMAKE_COMMAND} -E copy
-            "$<TARGET_FILE:${target}>"
-            "${package_dir}/bootstrap"
-
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${package_dir}"
+            COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:${target}>" "${package_dir}/bootstrap"
             COMMAND chmod +x "${package_dir}/bootstrap"
-
-            COMMAND zip -j -9
-            "${CMAKE_BINARY_DIR}/${target}.zip"
-            "${package_dir}/bootstrap"
+            COMMAND zip -j -9 "${CMAKE_BINARY_DIR}/${target}.zip" "${package_dir}/bootstrap"
 
             COMMENT "Packaging Lambda ${target}"
     )

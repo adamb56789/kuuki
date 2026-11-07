@@ -73,7 +73,7 @@ typedef struct {
 } Env;
 
 static Env load_env_vars() {
-    return (Env) {
+    return (Env){
         get_env_or_fatal("AWS_ACCESS_KEY_ID"),
         get_env_or_fatal("AWS_SECRET_ACCESS_KEY"),
         get_env_or_fatal("AWS_SESSION_TOKEN"),
@@ -115,9 +115,9 @@ static size_t curl_write_fixed_buffer_callback(const char *ptr, const size_t siz
 
 #ifdef CURL_DEBUG
 static int curl_print_debug_callback(CURL *handle, curl_infotype type, char *data, const size_t size, void *userdata) {
-    int print_size = (int) size;
+    int print_size = (int)size;
     if (size > 0 && data[size - 1] == '\n') print_size--;
-    LOG_DEBUG("CURL: %.*s", (int) print_size, data);
+    LOG_DEBUG("CURL: %.*s", (int)print_size, data);
     return 0;
 }
 #endif
@@ -165,14 +165,14 @@ HttpClient init_http_client(const Env *env, const size_t response_data_buffer_si
     CURL *handle = curl_easy_init();
 
     CurlResponse *curl_response = malloc(sizeof(*curl_response));
-    *curl_response = (CurlResponse) {malloc(response_data_buffer_size + 1), 0, response_data_buffer_size};
+    *curl_response = (CurlResponse){malloc(response_data_buffer_size + 1), 0, response_data_buffer_size};
 
     char *userpwd;
     asprintf(&userpwd, "%s:%s", env->access_key_id, env->secret_access_key);
 
     char *session_token_header = NULL;
     asprintf(&session_token_header, "x-amz-security-token: %s", env->session_token);
-    return (HttpClient) {handle, curl_response, userpwd, session_token_header};
+    return (HttpClient){handle, curl_response, userpwd, session_token_header};
 }
 
 int perform_http(const HttpClient *client, struct curl_slist *headers, const char *name_for_log) {
@@ -193,7 +193,7 @@ int perform_http(const HttpClient *client, struct curl_slist *headers, const cha
     }
     long http_code;
     curl_easy_getinfo(client->handle, CURLINFO_RESPONSE_CODE, &http_code);
-    return (int) http_code;
+    return (int)http_code;
 }
 
 int perform_dynamodb(const HttpClient *client, const char *operation, const char *name_for_log, char *input) {
@@ -227,7 +227,7 @@ int query(const HttpClient *client, Measurement *measurement) {
     const int code = perform_dynamodb(client, DYNAMODB_QUERY, "Test Query", input);
     const CurlResponse response = *client->response_data;
     if (code > 200) {
-        LOG_ERROR("Query returned code %d: %.*s", code, (int) response.length, response.data);
+        LOG_ERROR("Query returned code %d: %.*s", code, (int)response.length, response.data);
         return 1;
     }
 
@@ -281,7 +281,7 @@ int main(int argc, char *argv[]) {
         strcpy(invocation_id, get_response_header(&client, INVOCATION_ID_HEADER_NAME));
 
         char *event_data = client.response_data->data;
-        LOG_INFO("Received event: %.*s", (int) client.response_data->length, event_data);
+        LOG_INFO("Received event: %.*s", (int)client.response_data->length, event_data);
 
         char response_data[256];
 
@@ -315,7 +315,7 @@ int main(int argc, char *argv[]) {
 
         if (response_api_code >= 400) {
             FATAL_ERROR("Failed to post response with code %d: %.*s", response_api_code,
-                        (int) client.response_data->length, client.response_data->data);
+                        (int)client.response_data->length, client.response_data->data);
         }
     }
 }
