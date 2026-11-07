@@ -4,6 +4,7 @@ project(kuuki C)
 set(CMAKE_C_STANDARD 11)
 
 add_executable(json json.c)
+target_link_libraries(json PRIVATE m)
 
 add_executable(get_latest_data get_latest_data.c)
 

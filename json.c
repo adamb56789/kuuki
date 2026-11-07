@@ -1,4 +1,6 @@
 #include <assert.h>
+#include <float.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -25,7 +27,7 @@ typedef int64_t i64;
         goto defer;       \
     } while (0)
 
-typedef enum { JSONE_OK = 0, JSONE_MEMORY } JsonError;
+typedef enum { JSONE_OK = 0, JSONE_MEMORY, JSONE_INVALID_NUMBER } JsonError;
 
 enum JsonType { JSON_OBJECT, JSON_ARRAY, JSON_NUMBER, JSON_STRING, JSON_BOOLEAN, JSON_NULL };
 
@@ -171,21 +173,36 @@ JsonMember *json_object_get(const JsonObject *object, const char *name) {
     return NULL;
 }
 
-JsonError json_generate_inner(JsonArena *arena, const JsonValue *value) {
+void *json_generate_indent(JsonArena *arena, const int indent_width, const int depth) {
+    if (!arena_add_char(arena, '\n')) return NULL;
+    char indent[indent_width * depth + 1];
+    memset(indent, ' ', indent_width * depth);
+    indent[indent_width * depth] = 0;  // null-terminate
+    return arena_add_string(arena, indent);
+}
+
+JsonError json_generate_inner(JsonArena *arena, const JsonValue *value, const int pretty_width, const int depth) {
     switch (value->type) {
         case JSON_OBJECT:
             if (!arena_add_char(arena, '{')) return JSONE_MEMORY;
             for (int i = 0; i < value->object->count; ++i) {
+                if (pretty_width > 0) {
+                    if (!json_generate_indent(arena, pretty_width, depth + 1)) return JSONE_MEMORY;
+                }
+
                 JsonMember member = value->object->members[i];
 
                 if (!arena_add_char(arena, '"')) return JSONE_MEMORY;
-
-                arena_add_string(arena, member.name);
-
+                if (!arena_add_string(arena, member.name)) return JSONE_MEMORY;
                 if (!arena_add_char(arena, '"')) return JSONE_MEMORY;
                 if (!arena_add_char(arena, ':')) return JSONE_MEMORY;
 
-                const JsonError err = json_generate_inner(arena, &member.value);
+                // When pretty-formatting add a space after the colon
+                if (pretty_width > 0) {
+                    if (!arena_add_char(arena, ' ')) return JSONE_MEMORY;
+                }
+
+                const JsonError err = json_generate_inner(arena, &member.value, pretty_width, depth + 1);
                 if (err != JSONE_OK) return err;
 
                 // Last in object has no comma
@@ -193,14 +210,21 @@ JsonError json_generate_inner(JsonArena *arena, const JsonValue *value) {
                     if (!arena_add_char(arena, ',')) return JSONE_MEMORY;
                 }
             }
+            if (pretty_width > 0 && value->object->count > 0) {
+                if (!json_generate_indent(arena, pretty_width, depth)) return JSONE_MEMORY;
+            }
             if (!arena_add_char(arena, '}')) return JSONE_MEMORY;
             break;
         case JSON_ARRAY:
             if (!arena_add_char(arena, '[')) return JSONE_MEMORY;
             for (int i = 0; i < value->array->count; ++i) {
+                if (pretty_width > 0) {
+                    if (!json_generate_indent(arena, pretty_width, depth + 1)) return JSONE_MEMORY;
+                }
+
                 JsonValue element = value->array->elements[i];
 
-                const JsonError err = json_generate_inner(arena, &element);
+                const JsonError err = json_generate_inner(arena, &element, pretty_width, depth + 1);
                 if (err != JSONE_OK) return err;
 
                 // Last in array has no comma
@@ -208,12 +232,23 @@ JsonError json_generate_inner(JsonArena *arena, const JsonValue *value) {
                     if (!arena_add_char(arena, ',')) return JSONE_MEMORY;
                 }
             }
+            if (pretty_width > 0 && value->array->count > 0) {
+                if (!json_generate_indent(arena, pretty_width, depth)) return JSONE_MEMORY;
+            }
             if (!arena_add_char(arena, ']')) return JSONE_MEMORY;
             break;
         case JSON_NUMBER: {
-            const int number_length = snprintf(NULL, 0, "%.1f", value->number);
+            if (!isfinite(value->number)) return JSONE_INVALID_NUMBER;
+            const int number_length = snprintf(NULL, 0, "%.*G", DBL_DECIMAL_DIG, value->number);
             char *number_dest = arena_alloc(arena, number_length);
-            snprintf(number_dest, number_length + 1, "%.1f", value->number);
+            if (!number_dest) return JSONE_MEMORY;
+
+            // Need temporary space because snprintf includes null-terminator
+            // DBL_DECIMAL_DIG digits + decimal point + `E+XXX` + null-terminator
+            char temp_number_buffer[DBL_DECIMAL_DIG + 1 + 5 + 1];
+            snprintf(temp_number_buffer, number_length + 1, "%.*G", DBL_DECIMAL_DIG, value->number);
+            memcpy(number_dest, temp_number_buffer, number_length);
+
             break;
         }
         case JSON_STRING:
@@ -231,8 +266,8 @@ JsonError json_generate_inner(JsonArena *arena, const JsonValue *value) {
     return JSONE_OK;
 }
 
-JsonError json_generate(JsonArena *arena, const JsonValue *value) {
-    const JsonError err = json_generate_inner(arena, value);
+JsonError json_generate(JsonArena *arena, const JsonValue *value, const int pretty_width) {
+    const JsonError err = json_generate_inner(arena, value, pretty_width, 0);
     if (err != JSONE_OK) return err;
     if (!arena_add_char(arena, 0)) return JSONE_MEMORY;
     return JSONE_OK;
@@ -252,7 +287,7 @@ int main(int argc, char *argv[]) {
     document.root->type = JSON_OBJECT;
     document.root->object = object;
 
-    for (int i = 0; i < 70; ++i) {
+    for (int i = 60; i < 70; ++i) {
         char *name = arena_alloc(&arena, 8);
         sprintf(name, "%d", i);
         const JsonValue value = {JSON_NUMBER, .number = i};
@@ -260,17 +295,28 @@ int main(int argc, char *argv[]) {
     }
 
     const JsonMember *six_seven = json_object_get(object, "67");
+    if (six_seven) {
+        printf("%f\n", six_seven->value.number);
+    } else {
+        printf("67 not found\n");
+    }
 
     JsonArray *array = arena_alloc(&arena, sizeof(JsonArray));
     json_array_append(&arena, array, (JsonValue){JSON_BOOLEAN, .boolean = true});
     json_array_append(&arena, array, (JsonValue){JSON_BOOLEAN, .boolean = false});
     json_array_append(&arena, array, (JsonValue){JSON_NULL});
+    json_array_append(&arena, array, (JsonValue){JSON_NUMBER, .number = 3.141592653589793238462643383279});
+    json_array_append(
+        &arena, array,
+        (JsonValue){JSON_NUMBER, .number = 3141592653589793238462643383279.141592653589793238462643383279});
 
     JsonObject *empty_object = arena_alloc(&arena, sizeof(JsonObject));
     json_array_append(&arena, array, (JsonValue){JSON_OBJECT, .object = empty_object});
 
-    JsonObject *empty_array = arena_alloc(&arena, sizeof(JsonArray));
-    json_array_append(&arena, array, (JsonValue){JSON_ARRAY, .object = empty_array});
+    JsonArray *array_of_array = arena_alloc(&arena, sizeof(JsonArray));
+    JsonArray *empty_array = arena_alloc(&arena, sizeof(JsonArray));
+    json_array_append(&arena, array_of_array, (JsonValue){JSON_ARRAY, .array = empty_array});
+    json_array_append(&arena, array, (JsonValue){JSON_ARRAY, .array = array_of_array});
 
     json_object_add_member(&arena, object, (JsonMember){"array", (JsonValue){JSON_ARRAY, .array = array}});
 
@@ -280,10 +326,8 @@ int main(int argc, char *argv[]) {
     arena_add_char(&arena, 0);
     json_array_append(&arena, array, (JsonValue){JSON_STRING, .string = s});
 
-    printf("%f\n", six_seven->value.number);
-
     const char *json_string = arena.data + arena.used;
-    json_generate_inner(&arena, document.root);
+    json_generate(&arena, document.root, 4);
 
     printf("%s\n", json_string);
 
@@ -292,4 +336,7 @@ defer:
     return err;
 }
 // TODO U+0000 is a valid character so we need to use our own string representation that can contain 0
+// TODO Use string builder instead of writing to arena
+// TODO Add alignment to arena
+// TODO String escapes and unicode handling
 // Tape??
