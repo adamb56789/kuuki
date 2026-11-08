@@ -2,6 +2,7 @@
 #include <float.h>
 #include <math.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,11 +40,29 @@ typedef struct {
     size_t capacity;
 } Arena;
 
-void *arena_alloc(Arena *arena, const size_t size) {
-    if (arena->used + size > arena->capacity) return NULL;
+static size_t align_up(const size_t x) { return x + (_Alignof(max_align_t) - 1) & ~(_Alignof(max_align_t) - 1); }
 
-    void *ptr = arena->data + arena->used;
-    arena->used += size;
+Arena arena_create(const size_t capacity) {
+    void *data = aligned_alloc(_Alignof(max_align_t), align_up(capacity));
+
+    if (!data) return (Arena){0};
+
+    return (Arena){data, 0, capacity};
+}
+
+void arena_destroy(Arena *arena) {
+    free(arena->data);
+    arena->capacity = 0;
+    arena->used = 0;
+}
+
+void *arena_alloc(Arena *arena, const size_t size) {
+    const size_t offset = align_up(arena->used);
+
+    if (offset > arena->capacity || size > arena->capacity - offset) { return NULL; }
+
+    void *ptr = arena->data + offset;
+    arena->used = offset + size;
 
     memset(ptr, 0, size);
     return ptr;
@@ -51,10 +70,13 @@ void *arena_alloc(Arena *arena, const size_t size) {
 
 void *arena_realloc(Arena *arena, const void *old_ptr, const size_t old_size, const size_t new_size) {
     assert(new_size > old_size);
-    if (arena->used + new_size > arena->capacity) return NULL;
 
-    void *new_ptr = arena->data + arena->used;
-    arena->used += new_size;
+    const size_t offset = align_up(arena->used);
+
+    if (offset > arena->capacity || new_size > arena->capacity - offset) return NULL;
+
+    void *new_ptr = arena->data + offset;
+    arena->used = offset + new_size;
 
     memcpy(new_ptr, old_ptr, old_size);
     memset(new_ptr + old_size, 0, new_size - old_size);
@@ -155,7 +177,7 @@ typedef struct {
 } JsonDocument;
 
 JsonDocument json_document_init(const size_t capacity) {
-    void *data = malloc(capacity);
+    void *data = aligned_alloc(_Alignof(max_align_t), align_up(capacity));
 
     if (!data) return (JsonDocument){0};
 
@@ -322,14 +344,11 @@ enum JsonError json_generate(StringBuilder *sb, const JsonValue *value, const in
 int main(int argc, char *argv[]) {
     enum JsonError err = JSONE_OK;
 
-    JsonDocument document = json_document_init(MiB(1));
-    Arena arena = document.arena;
+    Arena arena = arena_create(MiB(1));
     if (!arena.data) DEFER(JSONE_MEMORY);
 
-    document.root = arena_alloc(&arena, sizeof(JsonValue));
-    document.root->type = JSON_OBJECT;
-    document.root->object = (JsonObject){0};
-    JsonObject *root_object = &document.root->object;
+    JsonValue root_val = json_object((JsonObject){0});
+    JsonObject *root_object = &root_val.object;
 
     for (int i = 60; i < 70; ++i) {
         char number_as_string[8];
@@ -384,7 +403,7 @@ int main(int argc, char *argv[]) {
         .chars = arena.data + arena.used,
     };
 
-    err = json_generate(&sb, document.root, 4);
+    err = json_generate(&sb, &root_val, 4);
     if (err != JSONE_OK) DEFER(err);
 
     // Update the arena with the memory the StringBuilder used.
@@ -413,7 +432,7 @@ int main(int argc, char *argv[]) {
     }
 
 defer:
-    free(document.arena.data);
+    arena_destroy(&arena);
     return err;
 }
 
