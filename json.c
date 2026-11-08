@@ -428,8 +428,7 @@ static enum JsonError json_generate_string(StringBuilder *sb, const StringView s
 
         if (byte_count == 1) {
             // ASCII character.
-            const unsigned char c = (unsigned char)sv.chars[start];
-
+            const unsigned char c = sv.chars[start];
             const unsigned char escaped = BACKSLASH_ESCAPE_MAP[c];
 
             if (!escaped) {
@@ -442,28 +441,18 @@ static enum JsonError json_generate_string(StringBuilder *sb, const StringView s
                 TRY(sb_append_char(sb, '\\'));
                 TRY(sb_append_char(sb, escaped));
             }
-
-        } else if (byte_count == 2) {
-            // Preserve UTF8-2
-            const StringView character = {2, sv.chars + start};
-
-            TRY(sb_append_sv(sb, character));
-
-        } else if (byte_count == 3) {
-            // Convert UTF8-3 to \uXXXX.
+        } else if (byte_count == 2) {  // UTF8-2 is unchanged
+            TRY(sb_append_char(sb, sv.chars[start]));
+            TRY(sb_append_char(sb, sv.chars[start + 1]));
+        } else if (byte_count == 3) {  // Convert UTF8-3 to \uXXXX.
             TRY(json_generate_u_escape(sb, (uint16_t)code_point));
-
-        } else {
-            // Convert UTF8-4 to UTF-16 surrogate pairs.
+        } else {  // Convert UTF8-4 to UTF-16 surrogate pairs.
             code_point -= 0x10000;
-
             TRY(json_generate_u_escape(sb, (uint16_t)(0xD800 + (code_point >> 10))));
             TRY(json_generate_u_escape(sb, (uint16_t)(0xDC00 + (code_point & 0x3FF))));
         }
     }
-
     TRY(sb_append_char(sb, '"'));
-
     return JSONE_OK;
 }
 
