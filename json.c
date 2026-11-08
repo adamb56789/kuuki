@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,7 +22,7 @@
         goto defer;                         \
     } while (0)
 
-enum JsonError { JSONE_OK = 0, JSONE_MEMORY, JSONE_INVALID_NUMBER };
+enum JsonError { JSONE_OK = 0, JSONE_MEMORY, JSONE_INVALID_NUMBER, JSONE_INVALID_STRING, JSONE_DEPTH_LIMIT_EXCEEDED };
 
 #define TRY(expr)                                   \
     do {                                            \
@@ -46,7 +47,10 @@ typedef struct {
     Arena strings;
 } JsonArena;
 
-static size_t align_up(const size_t x, const size_t a) { return x + (a - 1) & ~(a - 1); }
+static size_t align_up(const size_t x, const size_t alignment) {
+    assert(__builtin_popcountll(alignment) == 1);
+    return x + (alignment - 1) & ~(alignment - 1);
+}
 
 Arena arena_create(const size_t capacity, const size_t alignment) {
     void *data = aligned_alloc(alignment, align_up(capacity, alignment));
@@ -58,15 +62,7 @@ Arena arena_create(const size_t capacity, const size_t alignment) {
 
 void arena_destroy(Arena *arena) {
     free(arena->data);
-    arena->alignment = 0;
-    arena->capacity = 0;
-    arena->used = 0;
-}
-
-enum JsonError json_arena_create(JsonArena *arena, const size_t structure_size, const size_t strings_size) {
-    *arena = (JsonArena){arena_create(structure_size, 8), arena_create(strings_size, 1)};
-    if (!arena->structure.data || !arena->strings.data) return JSONE_MEMORY;
-    return JSONE_OK;
+    *arena = (Arena){0};
 }
 
 void json_arena_destroy(JsonArena *arena) {
@@ -74,15 +70,27 @@ void json_arena_destroy(JsonArena *arena) {
     arena_destroy(&arena->strings);
 }
 
+enum JsonError json_arena_create(JsonArena *arena, size_t structure_size, size_t strings_size) {
+    *arena = (JsonArena){0};
+    arena->structure = arena_create(structure_size, 8);
+    if (!arena->structure.data) return JSONE_MEMORY;
+
+    arena->strings = arena_create(strings_size, 1);
+    if (!arena->strings.data) {
+        json_arena_destroy(arena);
+        return JSONE_MEMORY;
+    }
+    return JSONE_OK;
+}
+
 void *arena_alloc(Arena *arena, const size_t size) {
     const size_t offset = align_up(arena->used, arena->alignment);
 
     if (offset > arena->capacity || size > arena->capacity - offset) { return NULL; }
 
-    void *ptr = arena->data + offset;
+    void *ptr = (char *)arena->data + offset;
     arena->used = offset + size;
 
-    memset(ptr, 0, size);
     return ptr;
 }
 
@@ -93,11 +101,10 @@ void *arena_realloc(Arena *arena, const void *old_ptr, const size_t old_size, co
 
     if (offset > arena->capacity || new_size > arena->capacity - offset) return NULL;
 
-    void *new_ptr = arena->data + offset;
+    void *new_ptr = (char *)arena->data + offset;
     arena->used = offset + new_size;
 
     memcpy(new_ptr, old_ptr, old_size);
-    memset(new_ptr + old_size, 0, new_size - old_size);
     return new_ptr;
 }
 
@@ -238,7 +245,7 @@ enum JsonError json_object_add_member_s(JsonArena *arena, JsonObject *object, ch
 
 enum JsonError json_object_add_member_s_s(JsonArena *arena, JsonObject *object, char *name, char *value) {
     String str;
-    copy_c_string_to_string(&arena->strings, value, &str);
+    TRY(copy_c_string_to_string(&arena->strings, value, &str));
     return json_object_add_member(arena, object, take_sv_on_c_string(name), json_string(str));
 }
 
@@ -270,7 +277,7 @@ enum JsonError json_array_append(JsonArena *arena, JsonArray *array, const JsonV
     return JSONE_OK;
 }
 
-JsonMember *json_object_get(const JsonObject *object, const StringView name) {
+const JsonMember *json_get(const JsonObject *object, const StringView name) {
     for (size_t i = 0; i < object->count; ++i) {
         const StringView member_name = take_sv_on_string(object->members[i].name);
         if (sv_equals(name, member_name)) return &object->members[i];
@@ -278,17 +285,61 @@ JsonMember *json_object_get(const JsonObject *object, const StringView name) {
     return NULL;
 }
 
-JsonMember *json_object_get_s(const JsonObject *object, char *name) {
-    return json_object_get(object, take_sv_on_c_string(name));
+const JsonObject *json_get_object(const JsonObject *object, const StringView name) {
+    const JsonMember *m = json_get(object, name);
+    if (!m) return NULL;
+    if (m->value.type == JSON_OBJECT) return &m->value.object;
+    return NULL;
+}
+const JsonArray *json_get_array(const JsonObject *object, const StringView name) {
+    const JsonMember *m = json_get(object, name);
+    if (!m) return NULL;
+    if (m->value.type == JSON_ARRAY) return &m->value.array;
+    return NULL;
+}
+const String *json_get_string(const JsonObject *object, const StringView name) {
+    const JsonMember *m = json_get(object, name);
+    if (!m) return NULL;
+    if (m->value.type == JSON_STRING) return &m->value.string;
+    return NULL;
+}
+const double *json_get_number(const JsonObject *object, const StringView name) {
+    const JsonMember *m = json_get(object, name);
+    if (!m) return NULL;
+    if (m->value.type == JSON_NUMBER) return &m->value.number;
+    return NULL;
+}
+const bool *json_get_bool(const JsonObject *object, const StringView name) {
+    const JsonMember *m = json_get(object, name);
+    if (!m) return NULL;
+    if (m->value.type == JSON_BOOLEAN) return &m->value.boolean;
+    return NULL;
+}
+
+const JsonMember *json_get_s(const JsonObject *object, char *name) {
+    return json_get(object, take_sv_on_c_string(name));
+}
+
+const JsonObject *json_get_object_s(const JsonObject *object, char *name) {
+    return json_get_object(object, take_sv_on_c_string(name));
+}
+const JsonArray *json_get_array_s(const JsonObject *object, char *name) {
+    return json_get_array(object, take_sv_on_c_string(name));
+}
+const String *json_get_string_s(const JsonObject *object, char *name) {
+    return json_get_string(object, take_sv_on_c_string(name));
+}
+const double *json_get_number_s(const JsonObject *object, char *name) {
+    return json_get_number(object, take_sv_on_c_string(name));
+}
+const bool *json_get_bool_s(const JsonObject *object, char *name) {
+    return json_get_bool(object, take_sv_on_c_string(name));
 }
 
 static enum JsonError json_generate_indent(StringBuilder *sb, const int indent_width, const int depth) {
     TRY(sb_append_char(sb, '\n'));
-    const int spaces = indent_width * depth;
-    char indent[spaces];
-    memset(indent, ' ', spaces);
-    const StringView sv = {spaces, indent};
-    return sb_append_sv(sb, sv);
+    for (size_t i = 0; i < indent_width * depth; ++i) { TRY(sb_append_char(sb, ' ')); }
+    return JSONE_OK;
 }
 
 static enum JsonError json_generate_number(StringBuilder *sb, const double number) {
@@ -296,24 +347,132 @@ static enum JsonError json_generate_number(StringBuilder *sb, const double numbe
 
     // Need temporary space because snprintf includes null-terminator
     // DBL_DECIMAL_DIG digits + decimal point + `E+XXX` + null-terminator
-    char temp_number_buffer[DBL_DECIMAL_DIG + 1 + 5 + 1];
-    sprintf(temp_number_buffer, "%.*G", DBL_DECIMAL_DIG, number);
+    char temp_number_buffer[32];
+    snprintf(temp_number_buffer, sizeof(temp_number_buffer), "%.*G", DBL_DECIMAL_DIG, number);
     TRY(sb_append_sv(sb, take_sv_on_c_string(temp_number_buffer)));
     return JSONE_OK;
 }
 
+static const unsigned char BACKSLASH_ESCAPE_MAP[256] = {
+    ['"'] = '"', ['\\'] = '\\', ['\b'] = 'b', ['\f'] = 'f', ['\n'] = 'n', ['\r'] = 'r', ['\t'] = 't',
+};
+
+static enum JsonError json_generate_u_escape(StringBuilder *sb, const uint16_t value) {
+    char buf[7];
+    snprintf(buf, 7, "\\u%.4X", value);
+    TRY(sb_append_sv(sb, take_sv_on_c_string(buf)));
+    return JSONE_OK;
+}
+
+static bool utf8_decode_next(const StringView sv, size_t *index, uint32_t *code_point) {
+    const size_t start = *index;
+    if (start >= sv.length) return false;
+
+    const unsigned char c = sv.chars[start];
+
+    uint32_t cp;
+    uint32_t min_value;
+    size_t byte_count;
+
+    if (c <= 0x7F) {
+        cp = c;
+        min_value = 0;
+        byte_count = 1;
+    } else if (c >= 0xC2 && c <= 0xDF) {
+        cp = c & 0x1F;
+        min_value = 0x80;
+        byte_count = 2;
+    } else if (c >= 0xE0 && c <= 0xEF) {
+        cp = c & 0x0F;
+        min_value = 0x800;
+        byte_count = 3;
+    } else if (c >= 0xF0 && c <= 0xF4) {
+        cp = c & 0x07;
+        min_value = 0x10000;
+        byte_count = 4;
+    } else {
+        return false;
+    }
+
+    if (byte_count > sv.length - start) { return false; }
+
+    for (size_t i = 1; i < byte_count; ++i) {
+        const unsigned char continuation = sv.chars[start + i];
+        if ((continuation & 0xC0) != 0x80) return false;
+
+        cp = cp << 6 | continuation & 0x3F;
+    }
+
+    if (cp < min_value || cp >= 0xD800 && cp <= 0xDFFF || cp > 0x10FFFF) return false;
+
+    *index = start + byte_count;
+    *code_point = cp;
+
+    return true;
+}
+
 static enum JsonError json_generate_string(StringBuilder *sb, const StringView sv) {
     TRY(sb_append_char(sb, '"'));
-    TRY(sb_append_sv(sb, sv));
+
+    for (size_t i = 0; i < sv.length;) {
+        const size_t start = i;
+
+        uint32_t code_point;
+
+        if (!utf8_decode_next(sv, &i, &code_point)) {
+            LOG_ERROR("Invalid UTF-8 at byte %zu", start);
+            return JSONE_INVALID_STRING;
+        }
+
+        const size_t byte_count = i - start;
+
+        if (byte_count == 1) {
+            // ASCII character.
+            const unsigned char c = (unsigned char)sv.chars[start];
+
+            const unsigned char escaped = BACKSLASH_ESCAPE_MAP[c];
+
+            if (!escaped) {
+                if (c >= 32) {
+                    TRY(sb_append_char(sb, c));
+                } else {
+                    TRY(json_generate_u_escape(sb, c));
+                }
+            } else {
+                TRY(sb_append_char(sb, '\\'));
+                TRY(sb_append_char(sb, escaped));
+            }
+
+        } else if (byte_count == 2) {
+            // Preserve UTF8-2
+            const StringView character = {2, sv.chars + start};
+
+            TRY(sb_append_sv(sb, character));
+
+        } else if (byte_count == 3) {
+            // Convert UTF8-3 to \uXXXX.
+            TRY(json_generate_u_escape(sb, (uint16_t)code_point));
+
+        } else {
+            // Convert UTF8-4 to UTF-16 surrogate pairs.
+            code_point -= 0x10000;
+
+            TRY(json_generate_u_escape(sb, (uint16_t)(0xD800 + (code_point >> 10))));
+            TRY(json_generate_u_escape(sb, (uint16_t)(0xDC00 + (code_point & 0x3FF))));
+        }
+    }
+
     TRY(sb_append_char(sb, '"'));
+
     return JSONE_OK;
 }
 
 enum JsonError json_generate_inner(StringBuilder *sb, const JsonValue *value, const int pretty, const int depth) {
+    if (depth >= 32) return JSONE_DEPTH_LIMIT_EXCEEDED;
     switch (value->type) {
         case JSON_OBJECT:
             TRY(sb_append_char(sb, '{'));
-            for (int i = 0; i < value->object.count; ++i) {
+            for (size_t i = 0; i < value->object.count; ++i) {
                 if (pretty > 0) TRY(json_generate_indent(sb, pretty, depth + 1));
 
                 JsonMember member = value->object.members[i];
@@ -335,7 +494,7 @@ enum JsonError json_generate_inner(StringBuilder *sb, const JsonValue *value, co
             break;
         case JSON_ARRAY:
             TRY(sb_append_char(sb, '['));
-            for (int i = 0; i < value->array.count; ++i) {
+            for (size_t i = 0; i < value->array.count; ++i) {
                 if (pretty > 0) TRY(json_generate_indent(sb, pretty, depth + 1));
 
                 JsonValue element = value->array.elements[i];
@@ -376,13 +535,13 @@ int main(int argc, char *argv[]) {
     TRY(json_arena_create(&arena, MiB(1), MiB(1)));
 
     JsonValue root_val = json_object((JsonObject){0});
-    JsonObject *root_object = &root_val.object;
+    JsonObject *root = &root_val.object;
 
     for (int i = 60; i < 70; ++i) {
         char number_as_string[8];
         sprintf(number_as_string, "%d", i);
 
-        json_object_add_member_s(&arena, root_object, number_as_string, json_number(i));
+        json_object_add_member_s(&arena, root, number_as_string, json_number(i));
     }
 
     JsonArray array = {0};
@@ -390,7 +549,7 @@ int main(int argc, char *argv[]) {
     json_array_append(&arena, &array, json_bool(false));
     json_array_append(&arena, &array, json_null());
     json_array_append(&arena, &array, json_number(3.141592653589793238462643383279));
-    json_array_append(&arena, &array, json_number(3141592653589793238462643383279.141592653589793238462643383279));
+    json_array_append(&arena, &array, json_number(-3141592653589793238462643383279.141592653589793238462643383279));
 
     json_array_append(&arena, &array, json_object((JsonObject){0}));
 
@@ -403,7 +562,7 @@ int main(int argc, char *argv[]) {
     copy_c_string_to_string(&arena.strings, "abc", &abc);
     json_array_append(&arena, &array, json_string(abc));
 
-    json_object_add_member_s(&arena, root_object, "array", json_array(array));
+    json_object_add_member_s(&arena, root, "array", json_array(array));
 
     {
         JsonObject query = {0};
@@ -422,12 +581,14 @@ int main(int argc, char *argv[]) {
         }
 
         json_object_add_member_s(&arena, &query, "ScanIndexForward", json_bool(false));
-        json_object_add_member_s(&arena, root_object, "Query", json_object(query));
+        json_object_add_member_s(&arena, root, "Query", json_object(query));
     }
 
-    json_object_add_member_s_s(&arena, root_object, "Unicode characters with more than 2 bytes",
-                               "𝄞⁶🤷‍♂️⁷歌");
-    json_object_add_member_s_s(&arena, root_object, "Reverse solidus escapes", "\" \\ \b \f \n \r \t");
+    json_object_add_member_s_s(&arena, root, "Unicode character with 2 bytes", "π");
+    json_object_add_member_s_s(&arena, root, "Unicode character with 3 bytes", "歌");
+    json_object_add_member_s_s(&arena, root, "Unicode character with 4 bytes", "𝄞");
+    json_object_add_member_s_s(&arena, root, "Emoji", "⁶🤷‍♂️⁷");
+    json_object_add_member_s_s(&arena, root, "Reverse solidus escapes", "\" \\ \b \f \n \r \t");
     {
         char buf[100];
         StringBuilder sb = {0, 100, buf};
@@ -440,7 +601,7 @@ int main(int argc, char *argv[]) {
         const StringView sv = {sb.length, buf};
         String string;
         copy_sv_to_string(&arena.strings, sv, &string);
-        json_object_add_member_s(&arena, root_object, "Must escape control characters", json_string(string));
+        json_object_add_member_s(&arena, root, "Must escape control characters", json_string(string));
     }
 
     LOG_INFO("Arena used %zu + %zu = %zu bytes", arena.structure.used, arena.strings.used,
@@ -459,33 +620,27 @@ int main(int argc, char *argv[]) {
     // Update the arena with the memory the StringBuilder used.
     arena.strings.used += sb.length;
 
-    if (sb.length > 0) {
-        printf("%s\n", sb.chars);
-    } else {
-        printf("Empty string\n");
-    }
+    fwrite(sb.chars, 1, sb.length, stdout);
+    putchar('\n');
 
-    const JsonMember *six_seven = json_object_get_s(root_object, "67");
+    const double *six_seven = json_get_number_s(root, "67");
     if (six_seven) {
-        printf("%f\n", six_seven->value.number);
+        printf("%f\n", *six_seven);
     } else {
         printf("67 not found\n");
     }
 
     {
-        const JsonMember *q = json_object_get_s(root_object, "Query");
-        const JsonMember *val = json_object_get_s(&q->value.object, "ExpressionAttributeValues");
-        const JsonMember *d = json_object_get_s(&val->value.object, ":d");
-        const JsonMember *s = json_object_get_s(&d->value.object, "S");
-        const StringView sv = take_sv_on_string(s->value.string);
-        LOG_INFO("pk: " SV_FMT, SV_ARG(sv));
+        const JsonObject *query = json_get_object_s(root, "Query");
+        const JsonObject *attribute_values = json_get_object_s(query, "ExpressionAttributeValues");
+        const JsonObject *pk_obj = json_get_object_s(attribute_values, ":pk");
+        const String *pk_string = json_get_string_s(pk_obj, "S");
+        const StringView device_id = take_sv_on_string(*pk_string);
+        LOG_INFO("pk: " SV_FMT, SV_ARG(device_id));
     }
 
 defer:
     json_arena_destroy(&arena);
     return err;
 }
-
-// TODO U+0000 is a valid character so we need to use our own string representation that can contain 0
-// TODO String escapes and unicode handling
 // Tape??
