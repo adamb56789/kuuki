@@ -2,6 +2,7 @@
 #include <float.h>
 #include <math.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -70,7 +71,7 @@ void json_arena_destroy(JsonArena *arena) {
     arena_destroy(&arena->strings);
 }
 
-enum JsonError json_arena_create(JsonArena *arena, size_t structure_size, size_t strings_size) {
+enum JsonError json_arena_create(JsonArena *arena, const size_t structure_size, const size_t strings_size) {
     *arena = (JsonArena){0};
     arena->structure = arena_create(structure_size, 8);
     if (!arena->structure.data) return JSONE_MEMORY;
@@ -173,14 +174,14 @@ typedef struct JsonMember JsonMember;
 // Web APIs (e.g. AWS) typically have a small (< 50) number of possible names. A hashmap is not necessary, O(n) is fine.
 typedef struct JsonObject {
     JsonMember *members;
-    size_t count;
-    size_t capacity;
+    uint32_t count;
+    uint32_t capacity;
 } JsonObject;
 
 typedef struct JsonArray {
     JsonValue *elements;
-    size_t count;
-    size_t capacity;
+    uint32_t count;
+    uint32_t capacity;
 } JsonArray;
 
 struct JsonValue {
@@ -209,7 +210,7 @@ JsonValue json_null() { return (JsonValue){JSON_NULL}; }
 enum JsonError json_object_add_member(JsonArena *arena, JsonObject *object, const StringView name_sv,
                                       const JsonValue value) {
     if (object->capacity == 0) {
-        const size_t initial_capacity = 4;
+        const int initial_capacity = 4;
 
         object->members = arena_alloc(&arena->structure, initial_capacity * sizeof(JsonMember));
         if (!object->members) return JSONE_MEMORY;
@@ -251,7 +252,7 @@ enum JsonError json_object_add_member_s_s(JsonArena *arena, JsonObject *object, 
 
 enum JsonError json_array_append(JsonArena *arena, JsonArray *array, const JsonValue value) {
     if (array->capacity == 0) {
-        const size_t initial_capacity = 4;
+        const int initial_capacity = 4;
 
         array->elements = arena_alloc(&arena->structure, initial_capacity * sizeof(JsonValue));
         if (!array->elements) return JSONE_MEMORY;
@@ -278,7 +279,7 @@ enum JsonError json_array_append(JsonArena *arena, JsonArray *array, const JsonV
 }
 
 const JsonMember *json_get(const JsonObject *object, const StringView name) {
-    for (size_t i = 0; i < object->count; ++i) {
+    for (uint32_t i = 0; i < object->count; ++i) {
         if (sv_equals(name, sv_on_string(object->members[i].name))) return &object->members[i];
     }
     return NULL;
@@ -335,7 +336,7 @@ const bool *json_get_bool_s(const JsonObject *object, char *name) {
 
 static enum JsonError json_generate_indent(StringBuilder *sb, const int indent_width, const int depth) {
     TRY(sb_append_char(sb, '\n'));
-    for (size_t i = 0; i < indent_width * depth; ++i) { TRY(sb_append_char(sb, ' ')); }
+    for (int i = 0; i < indent_width * depth; ++i) { TRY(sb_append_char(sb, ' ')); }
     return JSONE_OK;
 }
 
@@ -381,12 +382,13 @@ static enum JsonError json_generate_string(StringBuilder *sb, const StringView s
     return JSONE_OK;
 }
 
-enum JsonError json_generate_inner(StringBuilder *sb, const JsonValue *value, const int pretty, const int depth) {
+static enum JsonError json_generate_inner(StringBuilder *sb, const JsonValue *value, const int pretty,
+                                          const int depth) {
     if (depth >= 32) return JSONE_DEPTH_LIMIT_EXCEEDED;
     switch (value->type) {
         case JSON_OBJECT:
             TRY(sb_append_char(sb, '{'));
-            for (size_t i = 0; i < value->object.count; ++i) {
+            for (uint32_t i = 0; i < value->object.count; ++i) {
                 if (pretty > 0) TRY(json_generate_indent(sb, pretty, depth + 1));
 
                 const JsonMember member = value->object.members[i];
@@ -408,7 +410,7 @@ enum JsonError json_generate_inner(StringBuilder *sb, const JsonValue *value, co
             break;
         case JSON_ARRAY:
             TRY(sb_append_char(sb, '['));
-            for (size_t i = 0; i < value->array.count; ++i) {
+            for (uint32_t i = 0; i < value->array.count; ++i) {
                 if (pretty > 0) TRY(json_generate_indent(sb, pretty, depth + 1));
 
                 TRY(json_generate_inner(sb, value->array.elements + i, pretty, depth + 1));
@@ -522,7 +524,8 @@ static void test_json_build_generate() {
         .chars = arena.strings.data + arena.strings.used,
     };
 
-    assert(json_generate(&sb, &root_val, 0) == JSONE_OK);
+    const enum JsonError err = json_generate(&sb, &root_val, 0);
+    assert(err == JSONE_OK);
     // Update the arena with the memory the StringBuilder used.
     arena.strings.used += sb.length;
 

@@ -3,6 +3,8 @@ project(kuuki C)
 
 set(CMAKE_C_STANDARD 11)
 
+string(APPEND CMAKE_C_FLAGS_RELEASE " -march=native -g")
+
 add_executable(json json.c)
 target_link_libraries(json PRIVATE m)
 
