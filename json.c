@@ -2,10 +2,11 @@
 #include <float.h>
 #include <math.h>
 #include <stdbool.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#define STR(...) #__VA_ARGS__
 
 #define LOG_INFO(fmt, ...) fprintf(stderr, "[INFO] %s:%d: " fmt "\n", __FILE_NAME__, __LINE__, ##__VA_ARGS__)
 #define LOG_ERROR(fmt, ...) fprintf(stderr, "[ERROR] %s:%d: " fmt "\n", __FILE_NAME__, __LINE__, ##__VA_ARGS__)
@@ -21,7 +22,7 @@
         goto defer;                         \
     } while (0)
 
-enum JsonError { JSONE_OK = 0, JSONE_MEMORY, JSONE_INVALID_NUMBER, JSONE_INVALID_STRING, JSONE_DEPTH_LIMIT_EXCEEDED };
+enum JsonError { JSONE_OK = 0, JSONE_MEMORY, JSONE_INVALID_NUMBER, JSONE_DEPTH_LIMIT_EXCEEDED };
 
 #define TRY(expr)                                   \
     do {                                            \
@@ -170,13 +171,13 @@ typedef struct JsonValue JsonValue;
 typedef struct JsonMember JsonMember;
 
 // Web APIs (e.g. AWS) typically have a small (< 50) number of possible names. A hashmap is not necessary, O(n) is fine.
-typedef struct {
+typedef struct JsonObject {
     JsonMember *members;
     size_t count;
     size_t capacity;
 } JsonObject;
 
-typedef struct {
+typedef struct JsonArray {
     JsonValue *elements;
     size_t count;
     size_t capacity;
@@ -278,8 +279,7 @@ enum JsonError json_array_append(JsonArena *arena, JsonArray *array, const JsonV
 
 const JsonMember *json_get(const JsonObject *object, const StringView name) {
     for (size_t i = 0; i < object->count; ++i) {
-        const StringView member_name = sv_on_string(object->members[i].name);
-        if (sv_equals(name, member_name)) return &object->members[i];
+        if (sv_equals(name, sv_on_string(object->members[i].name))) return &object->members[i];
     }
     return NULL;
 }
@@ -354,61 +354,27 @@ static const unsigned char BACKSLASH_ESCAPE_MAP[256] = {
     ['"'] = '"', ['\\'] = '\\', ['\b'] = 'b', ['\f'] = 'f', ['\n'] = 'n', ['\r'] = 'r', ['\t'] = 't',
 };
 
-static enum JsonError json_generate_u_escape(StringBuilder *sb, const uint16_t value) {
+static enum JsonError json_generate_u_escape(StringBuilder *sb, const unsigned value) {
     char buf[7];
     snprintf(buf, 7, "\\u%.4X", value);
     TRY(sb_append_sv(sb, sv_on_c_string(buf)));
     return JSONE_OK;
 }
 
-static const uint8_t UTF8_CHAR_LENGTH[256] = {
-    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
-    2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-
-// Does not fully validate utf8, does protect against buffer overrun
 static enum JsonError json_generate_string(StringBuilder *sb, const StringView sv) {
     TRY(sb_append_char(sb, '"'));
-
     for (int i = 0; i < sv.length; ++i) {
         const unsigned char c = sv.chars[i];
-        const uint8_t char_length = UTF8_CHAR_LENGTH[c];
-        if (char_length == 1) {  // ascii range
-            const unsigned char escaped = BACKSLASH_ESCAPE_MAP[c];
-            if (!escaped) {
-                if (c >= 32) {  // Most likely (normal ascii character) first
-                    TRY(sb_append_char(sb, c));
-                } else {
-                    TRY(json_generate_u_escape(sb, c));
-                }
+        const unsigned char escaped = BACKSLASH_ESCAPE_MAP[c];
+        if (!escaped) {
+            if (c >= 32) {  // Most likely (normal ascii character) first
+                TRY(sb_append_char(sb, c));
             } else {
-                TRY(sb_append_char(sb, '\\'));
-                TRY(sb_append_char(sb, escaped));
+                TRY(json_generate_u_escape(sb, c));
             }
-        } else if (char_length == 2) {
-            if (i + 1 > sv.length) return JSONE_INVALID_STRING;
-            TRY(sb_append_char(sb, c));
-            TRY(sb_append_char(sb, sv.chars[++i]));
-        } else if (char_length == 3) {
-            if (i + 2 > sv.length) return JSONE_INVALID_STRING;
-            const uint32_t code_point = (uint32_t)(sv.chars[i + 0] & 0x0F) << 12 |
-                                        (uint32_t)(sv.chars[i + 1] & 0x3F) << 6 | (uint32_t)(sv.chars[i + 2] & 0x3F);
-            TRY(json_generate_u_escape(sb, code_point));
-            i += 2;
-        } else if (char_length == 4) {
-            if (i + 3 > sv.length) return JSONE_INVALID_STRING;
-            uint32_t code_point = (uint32_t)(sv.chars[i] & 0x07) << 18 | (uint32_t)(sv.chars[i + 1] & 0x3F) << 12 |
-                                  (uint32_t)(sv.chars[i + 2] & 0x3F) << 6 | (uint32_t)(sv.chars[i + 3] & 0x3F);
-            code_point -= 0x10000;
-            TRY(json_generate_u_escape(sb, 0xD800 + (code_point >> 10)));
-            TRY(json_generate_u_escape(sb, 0xDC00 + (code_point & 0x3FF)));
-            i += 3;
         } else {
-            return JSONE_INVALID_STRING;
+            TRY(sb_append_char(sb, '\\'));
+            TRY(sb_append_char(sb, escaped));
         }
     }
     TRY(sb_append_char(sb, '"'));
@@ -474,20 +440,18 @@ enum JsonError json_generate(StringBuilder *sb, const JsonValue *value, const in
     return json_generate_inner(sb, value, pretty_width, 0);
 }
 
-int main(int argc, char *argv[]) {
-    enum JsonError err = JSONE_OK;
-
+static void test_json_build_generate() {
     JsonArena arena;
-    TRY(json_arena_create(&arena, MiB(1), MiB(1)));
+    json_arena_create(&arena, MiB(1), MiB(1));
 
     JsonValue root_val = json_object((JsonObject){0});
-    JsonObject *root = &root_val.object;
+    JsonObject *root_obj = &root_val.object;
 
     for (int i = 60; i < 70; ++i) {
         char number_as_string[8];
         sprintf(number_as_string, "%d", i);
 
-        json_object_add_member_s(&arena, root, number_as_string, json_number(i));
+        json_object_add_member_s(&arena, root_obj, number_as_string, json_number(i));
     }
 
     JsonArray array = {0};
@@ -508,7 +472,7 @@ int main(int argc, char *argv[]) {
     copy_c_string_to_string(&arena.strings, "abc", &abc);
     json_array_append(&arena, &array, json_string(abc));
 
-    json_object_add_member_s(&arena, root, "array", json_array(array));
+    json_object_add_member_s(&arena, root_obj, "array", json_array(array));
 
     {
         JsonObject query = {0};
@@ -527,27 +491,25 @@ int main(int argc, char *argv[]) {
         }
 
         json_object_add_member_s(&arena, &query, "ScanIndexForward", json_bool(false));
-        json_object_add_member_s(&arena, root, "Query", json_object(query));
+        json_object_add_member_s(&arena, root_obj, "Query", json_object(query));
     }
 
-    json_object_add_member_s_s(&arena, root, "Unicode character with 2 bytes", "π");
-    json_object_add_member_s_s(&arena, root, "Unicode character with 3 bytes", "歌");
-    json_object_add_member_s_s(&arena, root, "Unicode character with 4 bytes", "𝄞");
-    json_object_add_member_s_s(&arena, root, "Emoji", "⁶🤷‍♂️⁷");
-    json_object_add_member_s_s(&arena, root, "Reverse solidus escapes", "\" \\ \b \f \n \r \t");
+    json_object_add_member_s_s(&arena, root_obj, "Unicode character with 2 bytes", "π");
+    json_object_add_member_s_s(&arena, root_obj, "Unicode character with 3 bytes", "歌");
+    json_object_add_member_s_s(&arena, root_obj, "Unicode character with 4 bytes", "𝄞");
+    json_object_add_member_s_s(&arena, root_obj, "Emoji", "⁶🤷‍♂️⁷");
+    json_object_add_member_s_s(&arena, root_obj, "Reverse solidus escapes", "\" \\ \b \f \n \r \t");
     {
         char buf[100];
         StringBuilder sb = {0, 100, buf};
-        sb_append_char(&sb, '<');
         for (char i = 31; i >= 0; i--) {
             sb_append_char(&sb, i);
             if (i > 0) sb_append_char(&sb, ' ');
         }
-        sb_append_char(&sb, '>');
         const StringView sv = {sb.length, buf};
         String string;
         copy_sv_to_string(&arena.strings, sv, &string);
-        json_object_add_member_s(&arena, root, "Must escape control characters", json_string(string));
+        json_object_add_member_s(&arena, root_obj, "Must escape control characters", json_string(string));
     }
 
     LOG_INFO("Arena used %zu + %zu = %zu bytes", arena.structure.used, arena.strings.used,
@@ -560,34 +522,36 @@ int main(int argc, char *argv[]) {
         .chars = arena.strings.data + arena.strings.used,
     };
 
-    err = json_generate(&sb, &root_val, 4);
-    if (err != JSONE_OK) DEFER(err);
-
+    assert(json_generate(&sb, &root_val, 0) == JSONE_OK);
     // Update the arena with the memory the StringBuilder used.
     arena.strings.used += sb.length;
 
-    fwrite(sb.chars, 1, sb.length, stdout);
-    putchar('\n');
+    LOG_INFO("Generated JSON: " SV_FMT, SV_ARG(sb));
 
-    const double *six_seven = json_get_number_s(root, "67");
-    if (six_seven) {
-        printf("%f\n", *six_seven);
-    } else {
-        printf("67 not found\n");
-    }
+    // clang-format off
+    const char *expected = STR({"60":60,"61":61,"62":62,"63":63,"64":64,"65":65,"66":66,"67":67,"68":68,"69":69,"array":[true,false,null,3.1415926535897931,-3.1415926535897932E+30,{},[[]],"abc"],"Query":{"TableName":"MeasurementsTable","Limit":1,"KeyConditionExpression":"device_id = :d","ExpressionAttributeValues":{":pk":{"S":"picotherm/1"}},"ScanIndexForward":false},"Unicode character with 2 bytes":"π","Unicode character with 3 bytes":"歌","Unicode character with 4 bytes":"𝄞","Emoji":"⁶🤷‍♂️⁷","Reverse solidus escapes":"\" \\ \b \f \n \r \t","Must escape control characters":"\u001F \u001E \u001D \u001C \u001B \u001A \u0019 \u0018 \u0017 \u0016 \u0015 \u0014 \u0013 \u0012 \u0011 \u0010 \u000F \u000E \r \f \u000B \n \t \b \u0007 \u0006 \u0005 \u0004 \u0003 \u0002 \u0001 \u0000"});
+    // clang-format on
+
+    assert(sb.length == strlen(expected));
+    assert(memcmp(sb.chars, expected, sb.length) == 0);
+
+    const double *six_seven = json_get_number_s(root_obj, "67");
+    assert(six_seven);
+    assert(*six_seven == 67);
 
     {
-        const JsonObject *query = json_get_object_s(root, "Query");
+        const JsonObject *query = json_get_object_s(root_obj, "Query");
         const JsonObject *attribute_values = json_get_object_s(query, "ExpressionAttributeValues");
         const JsonObject *pk_obj = json_get_object_s(attribute_values, ":pk");
         const String *pk_string = json_get_string_s(pk_obj, "S");
         const StringView device_id = sv_on_string(*pk_string);
-        LOG_INFO("pk: " SV_FMT, SV_ARG(device_id));
+        assert(sv_equals(sv_on_c_string("picotherm/1"), device_id));
     }
 
-defer:
     json_arena_destroy(&arena);
-    return err;
 }
-// TODO use https://github.com/douglascrockford/JSON-c for UTF handling
+
+int main(int argc, char *argv[]) { test_json_build_generate(); }
+// Validate utf8 in parser
+// Diverge fom the spec and disallow \u escapes besides 0x00-0x1F
 // Tape??
