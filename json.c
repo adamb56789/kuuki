@@ -1,40 +1,38 @@
 #include <assert.h>
+#include <ctype.h>
 #include <float.h>
 #include <math.h>
 #include <stdbool.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define STR(...) #__VA_ARGS__
+// ==================== General macros ====================
 
+#define STR(...) #__VA_ARGS__
 #define LOG_INFO(fmt, ...) fprintf(stderr, "[INFO] %s:%d: " fmt "\n", __FILE_NAME__, __LINE__, ##__VA_ARGS__)
+#define LOG_WARN(fmt, ...) fprintf(stderr, "[WARN] %s:%d: " fmt "\n", __FILE_NAME__, __LINE__, ##__VA_ARGS__)
 #define LOG_ERROR(fmt, ...) fprintf(stderr, "[ERROR] %s:%d: " fmt "\n", __FILE_NAME__, __LINE__, ##__VA_ARGS__)
 
-#define KiB(n) (n * 1024)
-#define MiB(n) (KiB(n) * 1024)
-#define GiB(n) (MiB(n) * 1024)
+enum KuukiError {
+    KUUKIE_OK = 0,
+    JSONE_MEMORY,
+    JSONE_INVALID_NUMBER,
+    JSONE_DEPTH_LIMIT_EXCEEDED,
+    JSONE_NUMBER_LENGTH_LIMIT_EXCEEDED,
+    JSONE_UNRECOGNIZED_TOKEN
+};
 
-#define DEFER(code)                         \
-    do {                                    \
-        err = code;                         \
-        LOG_ERROR("Caught error: %d", err); \
-        goto defer;                         \
+#define TRY(expr)                                  \
+    do {                                           \
+        enum KuukiError try_err = (expr);          \
+        if (try_err != KUUKIE_OK) {                \
+            LOG_WARN("Caught error: %d", try_err); \
+            return try_err;                        \
+        }                                          \
     } while (0)
 
-enum JsonError { JSONE_OK = 0, JSONE_MEMORY, JSONE_INVALID_NUMBER, JSONE_DEPTH_LIMIT_EXCEEDED };
-
-#define TRY(expr)                                   \
-    do {                                            \
-        enum JsonError try_err = (expr);            \
-        if (try_err != JSONE_OK) {                  \
-            LOG_ERROR("Caught error: %d", try_err); \
-            return try_err;                         \
-        }                                           \
-    } while (0)
-
-enum JsonType { JSON_OBJECT, JSON_ARRAY, JSON_NUMBER, JSON_STRING, JSON_BOOLEAN, JSON_NULL };
+// ==================== Allocators ====================
 
 typedef struct {
     void *data;
@@ -42,11 +40,6 @@ typedef struct {
     size_t used;
     size_t capacity;
 } Arena;
-
-typedef struct {
-    Arena structure;
-    Arena strings;
-} JsonArena;
 
 static size_t align_up(const size_t x, const size_t alignment) {
     assert(__builtin_popcountll(alignment) == 1);
@@ -64,24 +57,6 @@ Arena arena_create(const size_t capacity, const size_t alignment) {
 void arena_destroy(Arena *arena) {
     free(arena->data);
     *arena = (Arena){0};
-}
-
-void json_arena_destroy(JsonArena *arena) {
-    arena_destroy(&arena->structure);
-    arena_destroy(&arena->strings);
-}
-
-enum JsonError json_arena_create(JsonArena *arena, const size_t structure_size, const size_t strings_size) {
-    *arena = (JsonArena){0};
-    arena->structure = arena_create(structure_size, 8);
-    if (!arena->structure.data) return JSONE_MEMORY;
-
-    arena->strings = arena_create(strings_size, 1);
-    if (!arena->strings.data) {
-        json_arena_destroy(arena);
-        return JSONE_MEMORY;
-    }
-    return JSONE_OK;
 }
 
 void *arena_alloc(Arena *arena, const size_t size) {
@@ -109,17 +84,19 @@ void *arena_realloc(Arena *arena, const void *old_ptr, const size_t old_size, co
     return new_ptr;
 }
 
-typedef struct {
+// ==================== Strings ====================
+
+typedef struct StringView {
     size_t length;
     char *chars;
 } StringView;
 
-typedef struct {
+typedef struct String {
     size_t length;
     char *chars;
 } String;
 
-typedef struct {
+typedef struct StringBuilder {
     size_t length;
     size_t capacity;
     char *chars;
@@ -130,32 +107,38 @@ typedef struct {
 
 StringView sv_on_string(const String string) { return (StringView){string.length, string.chars}; }
 
-StringView sv_on_c_string(char *c_string) { return (StringView){strlen(c_string), c_string}; }
+StringView sv_on_c_string(const char *c_string) { return (StringView){strlen(c_string), (char *)c_string}; }
 
-enum JsonError copy_sv_to_string(Arena *string_arena, const StringView sv, String *string) {
+enum KuukiError copy_sv_to_string(Arena *string_arena, const StringView sv, String *string) {
     string->chars = arena_alloc(string_arena, sv.length);
     if (!string->chars) return JSONE_MEMORY;
 
     memcpy(string->chars, sv.chars, sv.length);
     string->length = sv.length;
-    return JSONE_OK;
+    return KUUKIE_OK;
 }
 
-enum JsonError copy_c_string_to_string(Arena *string_arena, char *c_string, String *string) {
+enum KuukiError copy_c_string_to_string(Arena *string_arena, const char *c_string, String *string) {
     return copy_sv_to_string(string_arena, sv_on_c_string(c_string), string);
 }
 
-enum JsonError sb_append_char(StringBuilder *sb, const char c) {
-    if (sb->length >= sb->capacity) return JSONE_MEMORY;
-    sb->chars[sb->length++] = c;
-    return JSONE_OK;
+void sv_chop_left(StringView *sv, const size_t n) {
+    const size_t chop_amount = n > sv->length ? sv->length : n;
+    sv->chars += chop_amount;
+    sv->length -= chop_amount;
 }
 
-enum JsonError sb_append_sv(StringBuilder *sb, StringView sv) {
+enum KuukiError sb_append_char(StringBuilder *sb, const char c) {
+    if (sb->length >= sb->capacity) return JSONE_MEMORY;
+    sb->chars[sb->length++] = c;
+    return KUUKIE_OK;
+}
+
+enum KuukiError sb_append_sv(StringBuilder *sb, StringView sv) {
     if (sb->length + sv.length > sb->capacity) return JSONE_MEMORY;
     memcpy(sb->chars + sb->length, sv.chars, sv.length);
     sb->length += sv.length;
-    return JSONE_OK;
+    return KUUKIE_OK;
 }
 
 bool sv_equals(const StringView sv1, const StringView sv2) {
@@ -168,20 +151,29 @@ bool sv_equals(const StringView sv1, const StringView sv2) {
     return true;
 }
 
+// ==================== Public JSON enums and structures ====================
+
+enum JsonType { JSON_OBJECT, JSON_ARRAY, JSON_NUMBER, JSON_STRING, JSON_BOOLEAN, JSON_NULL };
+
+typedef struct {
+    Arena structure;
+    Arena strings;
+} JsonArena;
+
 typedef struct JsonValue JsonValue;
 typedef struct JsonMember JsonMember;
 
 // Web APIs (e.g. AWS) typically have a small (< 50) number of possible names. A hashmap is not necessary, O(n) is fine.
 typedef struct JsonObject {
     JsonMember *members;
-    uint32_t count;
-    uint32_t capacity;
+    size_t count;
+    size_t capacity;
 } JsonObject;
 
 typedef struct JsonArray {
     JsonValue *elements;
-    uint32_t count;
-    uint32_t capacity;
+    size_t count;
+    size_t capacity;
 } JsonArray;
 
 struct JsonValue {
@@ -200,6 +192,26 @@ struct JsonMember {
     JsonValue value;
 };
 
+// ==================== Creating JSON structures ====================
+
+void json_arena_destroy(JsonArena *arena) {
+    arena_destroy(&arena->structure);
+    arena_destroy(&arena->strings);
+}
+
+enum KuukiError json_arena_create(JsonArena *arena, const size_t structure_size, const size_t strings_size) {
+    *arena = (JsonArena){0};
+    arena->structure = arena_create(structure_size, 8);
+    if (!arena->structure.data) return JSONE_MEMORY;
+
+    arena->strings = arena_create(strings_size, 1);
+    if (!arena->strings.data) {
+        json_arena_destroy(arena);
+        return JSONE_MEMORY;
+    }
+    return KUUKIE_OK;
+}
+
 JsonValue json_object(const JsonObject object) { return (JsonValue){JSON_OBJECT, .object = object}; }
 JsonValue json_array(const JsonArray array) { return (JsonValue){JSON_ARRAY, .array = array}; }
 JsonValue json_string(const String string) { return (JsonValue){JSON_STRING, .string = string}; }
@@ -207,8 +219,8 @@ JsonValue json_number(const double number) { return (JsonValue){JSON_NUMBER, .nu
 JsonValue json_bool(const bool boolean) { return (JsonValue){JSON_BOOLEAN, .boolean = boolean}; }
 JsonValue json_null() { return (JsonValue){JSON_NULL}; }
 
-enum JsonError json_object_add_member(JsonArena *arena, JsonObject *object, const StringView name_sv,
-                                      const JsonValue value) {
+enum KuukiError json_object_add_member(JsonArena *arena, JsonObject *object, const StringView name_sv,
+                                       const JsonValue value) {
     if (object->capacity == 0) {
         const int initial_capacity = 4;
 
@@ -237,20 +249,249 @@ enum JsonError json_object_add_member(JsonArena *arena, JsonObject *object, cons
     TRY(copy_sv_to_string(&arena->strings, name_sv, &name));
 
     object->members[object->count++] = (JsonMember){name, value};
-    return JSONE_OK;
+    return KUUKIE_OK;
 }
 
-enum JsonError json_object_add_member_s(JsonArena *arena, JsonObject *object, char *name, const JsonValue value) {
+enum KuukiError json_object_add_member_s(JsonArena *arena, JsonObject *object, const char *name,
+                                         const JsonValue value) {
     return json_object_add_member(arena, object, sv_on_c_string(name), value);
 }
 
-enum JsonError json_object_add_member_s_s(JsonArena *arena, JsonObject *object, char *name, char *value) {
+enum KuukiError json_object_add_member_s_s(JsonArena *arena, JsonObject *object, const char *name, const char *value) {
     String str;
     TRY(copy_c_string_to_string(&arena->strings, value, &str));
     return json_object_add_member(arena, object, sv_on_c_string(name), json_string(str));
 }
 
-enum JsonError json_array_append(JsonArena *arena, JsonArray *array, const JsonValue value) {
+// ==================== Lexing JSON ====================
+
+enum JsonKind {
+    BEGIN_ARRAY,
+    BEGIN_OBJECT,
+    END_ARRAY,
+    END_OBJECT,
+    NAME_SEPARATOR,
+    VALUE_SEPARATOR,
+    STRING,
+    NUMBER,
+    BOOLEAN,
+    JSON_KIND_NULL,
+    JSON_KIND_EOF,
+};
+
+typedef struct Token {
+    enum JsonKind kind;
+    union {
+        String string;
+        double number;
+        bool boolean;
+    };
+} Token;
+
+static enum KuukiError json_lex_next_number(Token *token, StringView *sv) {
+    enum State {
+        START,
+        AFTER_MINUS,
+        LEADING_ZERO,
+        LEADING_DIGIT,
+        INT_DIGITS,
+        FRACTION_DIGITS,
+        EXPONENT,
+        EXPONENT_SIGN,
+        EXPONENT_DIGITS,
+        END
+    };
+
+    const char *s = sv->chars;
+    const size_t len = sv->length;
+
+    int i = 0;
+    enum State state = START;
+    while (i <= 64) {
+        switch (state) {
+            case START:
+                if (len == i) return JSONE_UNRECOGNIZED_TOKEN;
+                if (isdigit(s[i])) {
+                    if (s[i] != '0') {
+                        state = LEADING_DIGIT;
+                    } else {
+                        state = LEADING_ZERO;
+                    }
+                } else if (s[i] == '-') {
+                    state = AFTER_MINUS;
+                } else {
+                    return JSONE_UNRECOGNIZED_TOKEN;
+                }
+                break;
+            case AFTER_MINUS:
+                if (len == i) return JSONE_UNRECOGNIZED_TOKEN;
+                if (isdigit(s[i])) {
+                    if (s[i] != '0') {
+                        state = LEADING_DIGIT;
+                    } else {
+                        state = LEADING_ZERO;
+                    }
+                } else {
+                    return JSONE_UNRECOGNIZED_TOKEN;
+                }
+                break;
+            case LEADING_ZERO:
+                if (len == i) {  // NOLINT(bugprone-branch-clone)
+                    state = END;
+                } else if (s[i] == '.') {
+                    state = FRACTION_DIGITS;
+                } else if (s[i] == 'e' || s[i] == 'E') {
+                    state = EXPONENT;
+                } else if (isdigit(s[i])) {
+                    // Without this it ends the token and will fail in parsing instead.
+                    // Still meets the spec, but want to explicitly capture the leading zero failure.
+                    return JSONE_UNRECOGNIZED_TOKEN;
+                } else {
+                    state = END;
+                }
+                break;
+            case LEADING_DIGIT:
+            case INT_DIGITS:
+                if (len == i) {  // NOLINT(bugprone-branch-clone)
+                    state = END;
+                } else if (isdigit(s[i])) {
+                    state = INT_DIGITS;
+                } else if (s[i] == '.') {
+                    state = FRACTION_DIGITS;
+                } else if (s[i] == 'e' || s[i] == 'E') {
+                    state = EXPONENT;
+                } else {
+                    state = END;
+                }
+                break;
+            case FRACTION_DIGITS:
+                // If we go to the END state here right after the . like "1." it is not valid according to RFC. JS accepts "1." though.
+                if (len == i) {  // NOLINT(bugprone-branch-clone)
+                    state = END;
+                } else if (isdigit(s[i])) {
+                    state = FRACTION_DIGITS;
+                } else if (s[i] == 'e' || s[i] == 'E') {
+                    state = EXPONENT;
+                } else {
+                    state = END;
+                }
+                break;
+            case EXPONENT:
+                if (len == i) return JSONE_UNRECOGNIZED_TOKEN;
+                if (isdigit(s[i])) {
+                    state = EXPONENT_DIGITS;
+                } else if (s[i] == '+' || s[i] == '-') {
+                    state = EXPONENT_SIGN;
+                } else {
+                    return JSONE_UNRECOGNIZED_TOKEN;
+                }
+                break;
+            case EXPONENT_SIGN:
+                if (len == i) return JSONE_UNRECOGNIZED_TOKEN;
+                if (isdigit(s[i])) {
+                    state = EXPONENT_DIGITS;
+                } else {
+                    return JSONE_UNRECOGNIZED_TOKEN;
+                }
+                break;
+            case EXPONENT_DIGITS:
+                if (len == i || !isdigit(s[i])) {
+                    state = END;
+                } else {
+                    state = EXPONENT_DIGITS;
+                }
+                break;
+            case END: {
+                i--;
+                if (i > 63) return JSONE_NUMBER_LENGTH_LIMIT_EXCEEDED;
+
+                // Copy to buffer to use strtod which expects null-termination
+                char buf[64] = {0};
+                memcpy(buf, sv->chars, i);
+
+                char *end;
+                *token = (Token){NUMBER, .number = strtod(buf, &end)};
+
+                // If the state machine is correct strtod should parse the same length
+                assert(end - buf == i);
+
+                sv_chop_left(sv, i);
+                return KUUKIE_OK;
+            }
+        }
+        i++;
+    }
+    return JSONE_NUMBER_LENGTH_LIMIT_EXCEEDED;
+}
+
+static enum KuukiError json_lex_next_token(Token *token, StringView *sv) {
+    while (sv->length > 0) {
+        const unsigned char c = *sv->chars;
+        switch (c) {
+            case '[':
+                *token = (Token){BEGIN_ARRAY};
+                sv_chop_left(sv, 1);
+                return KUUKIE_OK;
+            case '{':
+                *token = (Token){BEGIN_OBJECT};
+                sv_chop_left(sv, 1);
+                return KUUKIE_OK;
+            case ']':
+                *token = (Token){END_ARRAY};
+                sv_chop_left(sv, 1);
+                return KUUKIE_OK;
+            case '}':
+                *token = (Token){END_OBJECT};
+                sv_chop_left(sv, 1);
+                return KUUKIE_OK;
+            case ':':
+                *token = (Token){NAME_SEPARATOR};
+                sv_chop_left(sv, 1);
+                return KUUKIE_OK;
+            case ',':
+                *token = (Token){VALUE_SEPARATOR};
+                sv_chop_left(sv, 1);
+                return KUUKIE_OK;
+            case '"':
+                assert(false);
+            case 't': {
+                if (sv->length >= 4 && memcmp(sv->chars, "true", 4) == 0) {
+                    *token = (Token){BOOLEAN, .boolean = true};
+                    sv_chop_left(sv, 4);
+                    return KUUKIE_OK;
+                }
+                return JSONE_UNRECOGNIZED_TOKEN;
+            }
+            case 'f':
+                if (sv->length >= 5 && memcmp(sv->chars, "false", 5) == 0) {
+                    *token = (Token){BOOLEAN, .boolean = false};
+                    sv_chop_left(sv, 5);
+                    return KUUKIE_OK;
+                }
+                return JSONE_UNRECOGNIZED_TOKEN;
+            case 'n':
+                if (sv->length >= 4 && memcmp(sv->chars, "null", 4) == 0) {
+                    *token = (Token){JSON_KIND_NULL};
+                    sv_chop_left(sv, 4);
+                    return KUUKIE_OK;
+                }
+                return JSONE_UNRECOGNIZED_TOKEN;
+            default:
+                if (isspace(c)) {
+                    sv_chop_left(sv, 1);
+                } else if (isdigit(c) || c == '-') {
+                    return json_lex_next_number(token, sv);
+                } else {
+                    return JSONE_UNRECOGNIZED_TOKEN;
+                }
+        }
+    }
+
+    *token = (Token){JSON_KIND_EOF};
+    return KUUKIE_OK;
+}
+
+enum KuukiError json_array_append(JsonArena *arena, JsonArray *array, const JsonValue value) {
     if (array->capacity == 0) {
         const int initial_capacity = 4;
 
@@ -275,11 +516,13 @@ enum JsonError json_array_append(JsonArena *arena, JsonArray *array, const JsonV
     }
 
     array->elements[array->count++] = value;
-    return JSONE_OK;
+    return KUUKIE_OK;
 }
 
+// ==================== Reading JSON structures ====================
+
 const JsonMember *json_get(const JsonObject *object, const StringView name) {
-    for (uint32_t i = 0; i < object->count; ++i) {
+    for (size_t i = 0; i < object->count; ++i) {
         if (sv_equals(name, sv_on_string(object->members[i].name))) return &object->members[i];
     }
     return NULL;
@@ -316,31 +559,39 @@ const bool *json_get_bool(const JsonObject *object, const StringView name) {
     return NULL;
 }
 
-const JsonMember *json_get_s(const JsonObject *object, char *name) { return json_get(object, sv_on_c_string(name)); }
+const JsonMember *json_get_s(const JsonObject *object, const char *name) {
+    return json_get(object, sv_on_c_string(name));
+}
 
-const JsonObject *json_get_object_s(const JsonObject *object, char *name) {
+const JsonObject *json_get_object_s(const JsonObject *object, const char *name) {
     return json_get_object(object, sv_on_c_string(name));
 }
-const JsonArray *json_get_array_s(const JsonObject *object, char *name) {
+const JsonArray *json_get_array_s(const JsonObject *object, const char *name) {
     return json_get_array(object, sv_on_c_string(name));
 }
-const String *json_get_string_s(const JsonObject *object, char *name) {
+const String *json_get_string_s(const JsonObject *object, const char *name) {
     return json_get_string(object, sv_on_c_string(name));
 }
-const double *json_get_number_s(const JsonObject *object, char *name) {
+const double *json_get_number_s(const JsonObject *object, const char *name) {
     return json_get_number(object, sv_on_c_string(name));
 }
-const bool *json_get_bool_s(const JsonObject *object, char *name) {
+const bool *json_get_bool_s(const JsonObject *object, const char *name) {
     return json_get_bool(object, sv_on_c_string(name));
 }
 
-static enum JsonError json_generate_indent(StringBuilder *sb, const int indent_width, const int depth) {
+// ==================== Generating JSON from a structure ====================
+
+static const unsigned char GENERATE_BACKSLASH_ESCAPE_MAP[256] = {
+    ['"'] = '"', ['\\'] = '\\', ['\b'] = 'b', ['\f'] = 'f', ['\n'] = 'n', ['\r'] = 'r', ['\t'] = 't',
+};
+
+static enum KuukiError json_generate_indent(StringBuilder *sb, const int indent_width, const int depth) {
     TRY(sb_append_char(sb, '\n'));
     for (int i = 0; i < indent_width * depth; ++i) { TRY(sb_append_char(sb, ' ')); }
-    return JSONE_OK;
+    return KUUKIE_OK;
 }
 
-static enum JsonError json_generate_number(StringBuilder *sb, const double number) {
+static enum KuukiError json_generate_number(StringBuilder *sb, const double number) {
     if (!isfinite(number)) return JSONE_INVALID_NUMBER;
 
     // Need temporary space because snprintf includes null-terminator
@@ -348,25 +599,21 @@ static enum JsonError json_generate_number(StringBuilder *sb, const double numbe
     char temp_number_buffer[32];
     snprintf(temp_number_buffer, sizeof(temp_number_buffer), "%.*G", DBL_DECIMAL_DIG, number);
     TRY(sb_append_sv(sb, sv_on_c_string(temp_number_buffer)));
-    return JSONE_OK;
+    return KUUKIE_OK;
 }
 
-static const unsigned char BACKSLASH_ESCAPE_MAP[256] = {
-    ['"'] = '"', ['\\'] = '\\', ['\b'] = 'b', ['\f'] = 'f', ['\n'] = 'n', ['\r'] = 'r', ['\t'] = 't',
-};
-
-static enum JsonError json_generate_u_escape(StringBuilder *sb, const unsigned value) {
+static enum KuukiError json_generate_u_escape(StringBuilder *sb, const unsigned value) {
     char buf[7];
     snprintf(buf, 7, "\\u%.4X", value);
     TRY(sb_append_sv(sb, sv_on_c_string(buf)));
-    return JSONE_OK;
+    return KUUKIE_OK;
 }
 
-static enum JsonError json_generate_string(StringBuilder *sb, const StringView sv) {
+static enum KuukiError json_generate_string(StringBuilder *sb, const StringView sv) {
     TRY(sb_append_char(sb, '"'));
     for (int i = 0; i < sv.length; ++i) {
         const unsigned char c = sv.chars[i];
-        const unsigned char escaped = BACKSLASH_ESCAPE_MAP[c];
+        const unsigned char escaped = GENERATE_BACKSLASH_ESCAPE_MAP[c];
         if (!escaped) {
             if (c >= 32) {  // Most likely (normal ascii character) first
                 TRY(sb_append_char(sb, c));
@@ -379,16 +626,16 @@ static enum JsonError json_generate_string(StringBuilder *sb, const StringView s
         }
     }
     TRY(sb_append_char(sb, '"'));
-    return JSONE_OK;
+    return KUUKIE_OK;
 }
 
-static enum JsonError json_generate_inner(StringBuilder *sb, const JsonValue *value, const int pretty,
-                                          const int depth) {
+static enum KuukiError json_generate_inner(StringBuilder *sb, const JsonValue *value, const int pretty,
+                                           const int depth) {
     if (depth >= 32) return JSONE_DEPTH_LIMIT_EXCEEDED;
     switch (value->type) {
         case JSON_OBJECT:
             TRY(sb_append_char(sb, '{'));
-            for (uint32_t i = 0; i < value->object.count; ++i) {
+            for (size_t i = 0; i < value->object.count; ++i) {
                 if (pretty > 0) TRY(json_generate_indent(sb, pretty, depth + 1));
 
                 const JsonMember member = value->object.members[i];
@@ -410,7 +657,7 @@ static enum JsonError json_generate_inner(StringBuilder *sb, const JsonValue *va
             break;
         case JSON_ARRAY:
             TRY(sb_append_char(sb, '['));
-            for (uint32_t i = 0; i < value->array.count; ++i) {
+            for (size_t i = 0; i < value->array.count; ++i) {
                 if (pretty > 0) TRY(json_generate_indent(sb, pretty, depth + 1));
 
                 TRY(json_generate_inner(sb, value->array.elements + i, pretty, depth + 1));
@@ -435,16 +682,18 @@ static enum JsonError json_generate_inner(StringBuilder *sb, const JsonValue *va
             TRY(sb_append_sv(sb, sv_on_c_string("null")));
             break;
     }
-    return JSONE_OK;
+    return KUUKIE_OK;
 }
 
-enum JsonError json_generate(StringBuilder *sb, const JsonValue *value, const int pretty_width) {
+enum KuukiError json_generate(StringBuilder *sb, const JsonValue *value, const int pretty_width) {
     return json_generate_inner(sb, value, pretty_width, 0);
 }
 
+// ==================== Tests ====================
+
 static void test_json_build_generate() {
     JsonArena arena;
-    json_arena_create(&arena, MiB(1), MiB(1));
+    json_arena_create(&arena, 1024 * 1024, 1024 * 1024);
 
     JsonValue root_val = json_object((JsonObject){0});
     JsonObject *root_obj = &root_val.object;
@@ -524,8 +773,8 @@ static void test_json_build_generate() {
         .chars = arena.strings.data + arena.strings.used,
     };
 
-    const enum JsonError err = json_generate(&sb, &root_val, 0);
-    assert(err == JSONE_OK);
+    const enum KuukiError err = json_generate(&sb, &root_val, 0);
+    assert(err == KUUKIE_OK);
     // Update the arena with the memory the StringBuilder used.
     arena.strings.used += sb.length;
 
@@ -554,7 +803,131 @@ static void test_json_build_generate() {
     json_arena_destroy(&arena);
 }
 
-int main(int argc, char *argv[]) { test_json_build_generate(); }
-// Validate utf8 in parser
-// Diverge fom the spec and disallow \u escapes besides 0x00-0x1F
+static void test_json_lexer_simple_tokens() {
+    const char *text = "[] {}\r:,\ntrue\tfalse null";
+    StringView sv = sv_on_c_string(text);
+    Token t;
+
+    enum KuukiError err = json_lex_next_token(&t, &sv);
+    assert(err == KUUKIE_OK);
+    assert(t.kind == BEGIN_ARRAY);
+
+    err = json_lex_next_token(&t, &sv);
+    assert(err == KUUKIE_OK);
+    assert(t.kind == END_ARRAY);
+
+    err = json_lex_next_token(&t, &sv);
+    assert(err == KUUKIE_OK);
+    assert(t.kind == BEGIN_OBJECT);
+
+    err = json_lex_next_token(&t, &sv);
+    assert(err == KUUKIE_OK);
+    assert(t.kind == END_OBJECT);
+
+    err = json_lex_next_token(&t, &sv);
+    assert(err == KUUKIE_OK);
+    assert(t.kind == NAME_SEPARATOR);
+
+    err = json_lex_next_token(&t, &sv);
+    assert(err == KUUKIE_OK);
+    assert(t.kind == VALUE_SEPARATOR);
+
+    err = json_lex_next_token(&t, &sv);
+    assert(err == KUUKIE_OK);
+    assert(t.kind == BOOLEAN);
+    assert(t.boolean == true);
+
+    err = json_lex_next_token(&t, &sv);
+    assert(err == KUUKIE_OK);
+    assert(t.kind == BOOLEAN);
+    assert(t.boolean == false);
+
+    err = json_lex_next_token(&t, &sv);
+    assert(err == KUUKIE_OK);
+    assert(t.kind == JSON_KIND_NULL);
+}
+
+#define ASSERT_LEX_NUMBER(s, x)          \
+    sv = sv_on_c_string(s);              \
+    err = json_lex_next_number(&t, &sv); \
+    assert(err == KUUKIE_OK);            \
+    assert(t.kind == NUMBER);            \
+    assert(t.number == x)
+
+#define ASSERT_LEX_NUMBER_FAIL(s)        \
+    sv = sv_on_c_string(s);              \
+    err = json_lex_next_number(&t, &sv); \
+    assert(err == JSONE_UNRECOGNIZED_TOKEN)
+
+static void test_json_lexer_numbers() {
+    StringView sv;
+    Token t;
+    enum KuukiError err = 0;
+
+    // Valid JSON numbers
+    ASSERT_LEX_NUMBER("0", 0);
+    ASSERT_LEX_NUMBER("-0", 0);
+    ASSERT_LEX_NUMBER("67", 67);
+    ASSERT_LEX_NUMBER("0.0", 0.0);
+    ASSERT_LEX_NUMBER("-0.0", -0.0);
+    ASSERT_LEX_NUMBER("3.14", 3.14);
+    ASSERT_LEX_NUMBER("1e9", 1e9);
+    ASSERT_LEX_NUMBER("6.02E+23", 6.02e+23);
+    ASSERT_LEX_NUMBER("1.67e-27", 1.67e-27);
+    ASSERT_LEX_NUMBER("-123e45", -123e45);
+
+    // Parse double precision - no particular precision required by the RFC but it is advised
+    ASSERT_LEX_NUMBER("3.141592653589793238462643383279", 3.1415926535897931);
+
+    // Empty string
+    ASSERT_LEX_NUMBER_FAIL("");
+
+    // Starts with invalid character
+    ASSERT_LEX_NUMBER_FAIL("X");
+    ASSERT_LEX_NUMBER_FAIL(" ");
+    ASSERT_LEX_NUMBER_FAIL("*");
+    ASSERT_LEX_NUMBER_FAIL("/");
+
+    // Invalid starts that are valid elsewhere in numbers
+    ASSERT_LEX_NUMBER_FAIL("+");
+    ASSERT_LEX_NUMBER_FAIL("e9");
+    ASSERT_LEX_NUMBER_FAIL(".25");
+
+    // Invalid sign placements
+    ASSERT_LEX_NUMBER_FAIL("-");
+    ASSERT_LEX_NUMBER_FAIL("--1");
+    ASSERT_LEX_NUMBER_FAIL("+-1");
+    ASSERT_LEX_NUMBER_FAIL("-+1");
+
+    // Malformed exponents
+    ASSERT_LEX_NUMBER_FAIL("1e");
+    ASSERT_LEX_NUMBER_FAIL("1e+");
+    ASSERT_LEX_NUMBER_FAIL("1e-");
+    ASSERT_LEX_NUMBER_FAIL("1eX");
+    ASSERT_LEX_NUMBER_FAIL("1E+a");
+
+    // Leading zero
+    ASSERT_LEX_NUMBER_FAIL("01");
+    ASSERT_LEX_NUMBER_FAIL("03.14");
+    ASSERT_LEX_NUMBER_FAIL("-099");
+
+    // Values representable in floating point but not JSON
+    ASSERT_LEX_NUMBER_FAIL("NaN");
+    ASSERT_LEX_NUMBER_FAIL("INF");
+    ASSERT_LEX_NUMBER_FAIL("Infinity");
+
+    // Limits number length to 63 - implementation detail, not specified
+    ASSERT_LEX_NUMBER("123456789012345678901234567890123456789012345678901234567890123", 1.2345678901234569e+62);
+    sv = sv_on_c_string("1234567890123456789012345678901234567890123456789012345678901234");
+    err = json_lex_next_number(&t, &sv);
+    assert(err == JSONE_NUMBER_LENGTH_LIMIT_EXCEEDED);
+}
+
+int main(int argc, char *argv[]) {
+    test_json_build_generate();
+    test_json_lexer_simple_tokens();
+    test_json_lexer_numbers();
+}
+// Validate utf8 in parser ?
+// Diverge fom the RFC and disallow \u escapes besides 0x00-0x1F ?
 // Tape??
