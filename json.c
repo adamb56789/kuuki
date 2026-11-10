@@ -16,11 +16,14 @@
 
 enum KuukiError {
     KUUKIE_OK = 0,
-    JSONE_MEMORY,
+    KUUKI_OOM,
+    KUUKI_ARENA_FULL,
     JSONE_INVALID_NUMBER,
     JSONE_DEPTH_LIMIT_EXCEEDED,
     JSONE_NUMBER_LENGTH_LIMIT_EXCEEDED,
-    JSONE_UNRECOGNIZED_TOKEN
+    JSONE_UNRECOGNIZED_TOKEN,
+    JSONE_UNCLOSED_STRING,
+    JSONE_INVALID_ESCAPE
 };
 
 #define TRY(expr)                                  \
@@ -30,6 +33,12 @@ enum KuukiError {
             LOG_WARN("Caught error: %d", try_err); \
             return try_err;                        \
         }                                          \
+    } while (0)
+
+#define DEFER(code) \
+    do {            \
+        err = code; \
+        goto defer; \
     } while (0)
 
 // ==================== Allocators ====================
@@ -64,7 +73,7 @@ void *arena_alloc(Arena *arena, const size_t size) {
 
     if (offset > arena->capacity || size > arena->capacity - offset) { return NULL; }
 
-    void *ptr = (char *)arena->data + offset;
+    void *ptr = arena->data + offset;
     arena->used = offset + size;
 
     return ptr;
@@ -77,7 +86,7 @@ void *arena_realloc(Arena *arena, const void *old_ptr, const size_t old_size, co
 
     if (offset > arena->capacity || new_size > arena->capacity - offset) return NULL;
 
-    void *new_ptr = (char *)arena->data + offset;
+    void *new_ptr = arena->data + offset;
     arena->used = offset + new_size;
 
     memcpy(new_ptr, old_ptr, old_size);
@@ -97,6 +106,7 @@ typedef struct String {
 } String;
 
 typedef struct StringBuilder {
+    Arena *arena;
     size_t length;
     size_t capacity;
     char *chars;
@@ -111,7 +121,7 @@ StringView sv_on_c_string(const char *c_string) { return (StringView){strlen(c_s
 
 enum KuukiError copy_sv_to_string(Arena *string_arena, const StringView sv, String *string) {
     string->chars = arena_alloc(string_arena, sv.length);
-    if (!string->chars) return JSONE_MEMORY;
+    if (!string->chars) return KUUKI_ARENA_FULL;
 
     memcpy(string->chars, sv.chars, sv.length);
     string->length = sv.length;
@@ -128,14 +138,41 @@ void sv_chop_left(StringView *sv, const size_t n) {
     sv->length -= chop_amount;
 }
 
+// Transfer ownership of the remaining memory in arena to the StringBuilder.
+// Nothing else can alloc on the arena until the SB is released as the arena spare capacity is shrunk to zero.
+StringBuilder sb_create_and_borrow_arena(Arena *arena) {
+    const StringBuilder sb = {
+        .arena = arena,
+        .length = 0,
+        .capacity = arena->capacity - arena->used,
+        .chars = arena->data + arena->used,
+    };
+    arena->capacity = arena->used;
+    return sb;
+}
+
+// Updates the arena with the memory the StringBuilder used to transfer ownership back.
+String sb_complete_and_release_arena(StringBuilder *sb) {
+    // The sb_ functions should check bounds and never allow this
+    assert(sb->length <= sb->capacity);
+
+    const String string = {sb->length, sb->chars};
+
+    sb->arena->capacity += sb->capacity;
+    sb->arena->used += sb->length;
+    sb->capacity = 0;
+    sb->length = 0;
+    return string;
+}
+
 enum KuukiError sb_append_char(StringBuilder *sb, const char c) {
-    if (sb->length >= sb->capacity) return JSONE_MEMORY;
+    if (sb->length >= sb->capacity) return KUUKI_ARENA_FULL;
     sb->chars[sb->length++] = c;
     return KUUKIE_OK;
 }
 
-enum KuukiError sb_append_sv(StringBuilder *sb, StringView sv) {
-    if (sb->length + sv.length > sb->capacity) return JSONE_MEMORY;
+enum KuukiError sb_append_sv(StringBuilder *sb, const StringView sv) {
+    if (sb->length + sv.length > sb->capacity) return KUUKI_ARENA_FULL;
     memcpy(sb->chars + sb->length, sv.chars, sv.length);
     sb->length += sv.length;
     return KUUKIE_OK;
@@ -202,12 +239,12 @@ void json_arena_destroy(JsonArena *arena) {
 enum KuukiError json_arena_create(JsonArena *arena, const size_t structure_size, const size_t strings_size) {
     *arena = (JsonArena){0};
     arena->structure = arena_create(structure_size, 8);
-    if (!arena->structure.data) return JSONE_MEMORY;
+    if (!arena->structure.data) return KUUKI_OOM;
 
     arena->strings = arena_create(strings_size, 1);
     if (!arena->strings.data) {
         json_arena_destroy(arena);
-        return JSONE_MEMORY;
+        return KUUKI_OOM;
     }
     return KUUKIE_OK;
 }
@@ -225,7 +262,7 @@ enum KuukiError json_object_add_member(JsonArena *arena, JsonObject *object, con
         const int initial_capacity = 4;
 
         object->members = arena_alloc(&arena->structure, initial_capacity * sizeof(JsonMember));
-        if (!object->members) return JSONE_MEMORY;
+        if (!object->members) return KUUKI_ARENA_FULL;
 
         object->capacity = initial_capacity;
     } else if (object->count >= object->capacity) {
@@ -233,12 +270,12 @@ enum KuukiError json_object_add_member(JsonArena *arena, JsonObject *object, con
 
         // Arena has not grown so we can expand the existing allocation
         if (arena->structure.data + arena->structure.used == object->members + object->count) {
-            if (arena->structure.used + old_size > arena->structure.capacity) return JSONE_MEMORY;
+            if (arena->structure.used + old_size > arena->structure.capacity) return KUUKI_ARENA_FULL;
             arena->structure.used += old_size;
             object->capacity *= 2;
         } else {
             JsonMember *new_members = arena_realloc(&arena->structure, object->members, old_size, 2 * old_size);
-            if (!new_members) return JSONE_MEMORY;
+            if (!new_members) return KUUKI_ARENA_FULL;
             object->members = new_members;
             object->capacity *= 2;
         }
@@ -266,15 +303,15 @@ enum KuukiError json_object_add_member_s_s(JsonArena *arena, JsonObject *object,
 // ==================== Lexing JSON ====================
 
 enum JsonKind {
-    BEGIN_ARRAY,
-    BEGIN_OBJECT,
-    END_ARRAY,
-    END_OBJECT,
-    NAME_SEPARATOR,
-    VALUE_SEPARATOR,
-    STRING,
-    NUMBER,
-    BOOLEAN,
+    JSON_KIND_BEGIN_ARRAY,
+    JSON_KIND_BEGIN_OBJECT,
+    JSON_KIND_END_ARRAY,
+    JSON_KIND_END_OBJECT,
+    JSON_KIND_NAME_SEPARATOR,
+    JSON_KIND_VALUE_SEPARATOR,
+    JSON_KIND_STRING,
+    JSON_KIND_NUMBER,
+    JSON_KIND_BOOLEAN,
     JSON_KIND_NULL,
     JSON_KIND_EOF,
 };
@@ -307,7 +344,7 @@ static enum KuukiError json_lex_next_number(Token *token, StringView *sv) {
 
     int i = 0;
     enum State state = START;
-    while (i <= 64) {
+    while (1) {
         switch (state) {
             case START:
                 if (len == i) return JSONE_UNRECOGNIZED_TOKEN;
@@ -342,10 +379,6 @@ static enum KuukiError json_lex_next_number(Token *token, StringView *sv) {
                     state = FRACTION_DIGITS;
                 } else if (s[i] == 'e' || s[i] == 'E') {
                     state = EXPONENT;
-                } else if (isdigit(s[i])) {
-                    // Without this it ends the token and will fail in parsing instead.
-                    // Still meets the spec, but want to explicitly capture the leading zero failure.
-                    return JSONE_UNRECOGNIZED_TOKEN;
                 } else {
                     state = END;
                 }
@@ -365,7 +398,8 @@ static enum KuukiError json_lex_next_number(Token *token, StringView *sv) {
                 }
                 break;
             case FRACTION_DIGITS:
-                // If we go to the END state here right after the . like "1." it is not valid according to RFC. JS accepts "1." though.
+                // If we go to the END state here right after the . like "1." it is not valid according to RFC. JS
+                // accepts "1." though.
                 if (len == i) {  // NOLINT(bugprone-branch-clone)
                     state = END;
                 } else if (isdigit(s[i])) {
@@ -403,14 +437,12 @@ static enum KuukiError json_lex_next_number(Token *token, StringView *sv) {
                 break;
             case END: {
                 i--;
-                if (i > 63) return JSONE_NUMBER_LENGTH_LIMIT_EXCEEDED;
-
                 // Copy to buffer to use strtod which expects null-termination
                 char buf[64] = {0};
                 memcpy(buf, sv->chars, i);
 
                 char *end;
-                *token = (Token){NUMBER, .number = strtod(buf, &end)};
+                *token = (Token){JSON_KIND_NUMBER, .number = strtod(buf, &end)};
 
                 // If the state machine is correct strtod should parse the same length
                 assert(end - buf == i);
@@ -421,50 +453,93 @@ static enum KuukiError json_lex_next_number(Token *token, StringView *sv) {
         }
         i++;
     }
-    return JSONE_NUMBER_LENGTH_LIMIT_EXCEEDED;
 }
 
-static enum KuukiError json_lex_next_token(Token *token, StringView *sv) {
+static const char PARSE_BACKSLASH_ESCAPE_MAP[256] = {
+    ['"'] = '"', ['\\'] = '\\', ['b'] = '\b', ['f'] = '\f', ['n'] = '\n', ['r'] = '\r', ['t'] = '\t',
+};
+static const char PARSE_BACKSLASH_ESCAPE_MAP_INVERSE[256] = {
+    ['"'] = '"', ['\\'] = '\\', ['\b'] = 'b', ['\f'] = 'f', ['\n'] = 'n', ['\r'] = 'r', ['\t'] = 't',
+};
+
+static enum KuukiError json_lex_next_string(Arena *arena, Token *token, StringView *sv) {
+    if (*sv->chars != '"') return JSONE_UNRECOGNIZED_TOKEN;
+    sv_chop_left(sv, 1);
+
+    enum KuukiError err;
+    StringBuilder sb = sb_create_and_borrow_arena(arena);
+
+    while (sv->length > 0) {
+        if (*sv->chars == '"') {
+            sv_chop_left(sv, 1);
+
+            const String string = sb_complete_and_release_arena(&sb);
+            *token = (Token){JSON_KIND_STRING, .string = string};
+
+            return KUUKIE_OK;
+        }
+
+        if (*sv->chars == '\\') {
+            sv_chop_left(sv, 1);
+            if (sv->length == 0) DEFER(JSONE_INVALID_ESCAPE);
+
+            const char c = PARSE_BACKSLASH_ESCAPE_MAP[*sv->chars];
+            if (c == 0) DEFER(JSONE_INVALID_ESCAPE);
+
+            sb_append_char(&sb, c);
+            sv_chop_left(sv, 1);
+        } else {
+            sb_append_char(&sb, *sv->chars);
+            sv_chop_left(sv, 1);
+        }
+    }
+    err = JSONE_UNCLOSED_STRING;
+defer:
+    sb_complete_and_release_arena(&sb);
+    return err;
+}
+
+static enum KuukiError json_lex_next_token(Arena *arena, Token *token, StringView *sv) {
     while (sv->length > 0) {
         const unsigned char c = *sv->chars;
         switch (c) {
             case '[':
-                *token = (Token){BEGIN_ARRAY};
+                *token = (Token){JSON_KIND_BEGIN_ARRAY};
                 sv_chop_left(sv, 1);
                 return KUUKIE_OK;
             case '{':
-                *token = (Token){BEGIN_OBJECT};
+                *token = (Token){JSON_KIND_BEGIN_OBJECT};
                 sv_chop_left(sv, 1);
                 return KUUKIE_OK;
             case ']':
-                *token = (Token){END_ARRAY};
+                *token = (Token){JSON_KIND_END_ARRAY};
                 sv_chop_left(sv, 1);
                 return KUUKIE_OK;
             case '}':
-                *token = (Token){END_OBJECT};
+                *token = (Token){JSON_KIND_END_OBJECT};
                 sv_chop_left(sv, 1);
                 return KUUKIE_OK;
             case ':':
-                *token = (Token){NAME_SEPARATOR};
+                *token = (Token){JSON_KIND_NAME_SEPARATOR};
                 sv_chop_left(sv, 1);
                 return KUUKIE_OK;
             case ',':
-                *token = (Token){VALUE_SEPARATOR};
+                *token = (Token){JSON_KIND_VALUE_SEPARATOR};
                 sv_chop_left(sv, 1);
                 return KUUKIE_OK;
             case '"':
-                assert(false);
-            case 't': {
+                json_lex_next_string(arena, token, sv);
+                return KUUKIE_OK;
+            case 't':
                 if (sv->length >= 4 && memcmp(sv->chars, "true", 4) == 0) {
-                    *token = (Token){BOOLEAN, .boolean = true};
+                    *token = (Token){JSON_KIND_BOOLEAN, .boolean = true};
                     sv_chop_left(sv, 4);
                     return KUUKIE_OK;
                 }
                 return JSONE_UNRECOGNIZED_TOKEN;
-            }
             case 'f':
                 if (sv->length >= 5 && memcmp(sv->chars, "false", 5) == 0) {
-                    *token = (Token){BOOLEAN, .boolean = false};
+                    *token = (Token){JSON_KIND_BOOLEAN, .boolean = false};
                     sv_chop_left(sv, 5);
                     return KUUKIE_OK;
                 }
@@ -496,7 +571,7 @@ enum KuukiError json_array_append(JsonArena *arena, JsonArray *array, const Json
         const int initial_capacity = 4;
 
         array->elements = arena_alloc(&arena->structure, initial_capacity * sizeof(JsonValue));
-        if (!array->elements) return JSONE_MEMORY;
+        if (!array->elements) return KUUKI_ARENA_FULL;
 
         array->capacity = 4;
     } else if (array->count >= array->capacity) {
@@ -504,12 +579,12 @@ enum KuukiError json_array_append(JsonArena *arena, JsonArray *array, const Json
 
         // Arena has not grown so we can expand the existing allocation
         if (arena->structure.data + arena->structure.used == array->elements + array->count) {
-            if (arena->structure.used + old_size > arena->structure.capacity) return JSONE_MEMORY;
+            if (arena->structure.used + old_size > arena->structure.capacity) return KUUKI_ARENA_FULL;
             arena->structure.used += old_size;
             array->capacity *= 2;
         } else {
             JsonValue *new_elements = arena_realloc(&arena->structure, array->elements, old_size, 2 * old_size);
-            if (!new_elements) return JSONE_MEMORY;
+            if (!new_elements) return KUUKI_ARENA_FULL;
             array->elements = new_elements;
             array->capacity *= 2;
         }
@@ -581,10 +656,6 @@ const bool *json_get_bool_s(const JsonObject *object, const char *name) {
 
 // ==================== Generating JSON from a structure ====================
 
-static const unsigned char GENERATE_BACKSLASH_ESCAPE_MAP[256] = {
-    ['"'] = '"', ['\\'] = '\\', ['\b'] = 'b', ['\f'] = 'f', ['\n'] = 'n', ['\r'] = 'r', ['\t'] = 't',
-};
-
 static enum KuukiError json_generate_indent(StringBuilder *sb, const int indent_width, const int depth) {
     TRY(sb_append_char(sb, '\n'));
     for (int i = 0; i < indent_width * depth; ++i) { TRY(sb_append_char(sb, ' ')); }
@@ -613,7 +684,7 @@ static enum KuukiError json_generate_string(StringBuilder *sb, const StringView 
     TRY(sb_append_char(sb, '"'));
     for (int i = 0; i < sv.length; ++i) {
         const unsigned char c = sv.chars[i];
-        const unsigned char escaped = GENERATE_BACKSLASH_ESCAPE_MAP[c];
+        const unsigned char escaped = PARSE_BACKSLASH_ESCAPE_MAP_INVERSE[c];
         if (!escaped) {
             if (c >= 32) {  // Most likely (normal ascii character) first
                 TRY(sb_append_char(sb, c));
@@ -751,41 +822,34 @@ static void test_json_build_generate() {
     json_object_add_member_s_s(&arena, root_obj, "Emoji", "⁶🤷‍♂️⁷");
     json_object_add_member_s_s(&arena, root_obj, "Reverse solidus escapes", "\" \\ \b \f \n \r \t");
     {
-        char buf[100];
-        StringBuilder sb = {0, 100, buf};
+        StringBuilder sb = sb_create_and_borrow_arena(&arena.strings);
         for (char i = 31; i >= 0; i--) {
             sb_append_char(&sb, i);
             if (i > 0) sb_append_char(&sb, ' ');
         }
-        const StringView sv = {sb.length, buf};
-        String string;
-        copy_sv_to_string(&arena.strings, sv, &string);
+
+        const String string = sb_complete_and_release_arena(&sb);
         json_object_add_member_s(&arena, root_obj, "Must escape control characters", json_string(string));
     }
 
     LOG_INFO("Arena used %zu + %zu = %zu bytes", arena.structure.used, arena.strings.used,
              arena.structure.used + arena.strings.used);
 
-    // Let the StringBuilder allocate its own memory in the arena. Nothing else can alloc on the arena until returned.
-    StringBuilder sb = {
-        .length = 0,
-        .capacity = arena.strings.capacity - arena.strings.used,
-        .chars = arena.strings.data + arena.strings.used,
-    };
+    StringBuilder sb = sb_create_and_borrow_arena(&arena.strings);
 
     const enum KuukiError err = json_generate(&sb, &root_val, 0);
     assert(err == KUUKIE_OK);
-    // Update the arena with the memory the StringBuilder used.
-    arena.strings.used += sb.length;
 
-    LOG_INFO("Generated JSON: " SV_FMT, SV_ARG(sb));
+    String json_string = sb_complete_and_release_arena(&sb);
+
+    LOG_INFO("Generated JSON: " SV_FMT, SV_ARG(json_string));
 
     // clang-format off
     const char *expected = STR({"60":60,"61":61,"62":62,"63":63,"64":64,"65":65,"66":66,"67":67,"68":68,"69":69,"array":[true,false,null,3.1415926535897931,-3.1415926535897932E+30,{},[[]],"abc"],"Query":{"TableName":"MeasurementsTable","Limit":1,"KeyConditionExpression":"device_id = :d","ExpressionAttributeValues":{":pk":{"S":"picotherm/1"}},"ScanIndexForward":false},"Unicode character with 2 bytes":"π","Unicode character with 3 bytes":"歌","Unicode character with 4 bytes":"𝄞","Emoji":"⁶🤷‍♂️⁷","Reverse solidus escapes":"\" \\ \b \f \n \r \t","Must escape control characters":"\u001F \u001E \u001D \u001C \u001B \u001A \u0019 \u0018 \u0017 \u0016 \u0015 \u0014 \u0013 \u0012 \u0011 \u0010 \u000F \u000E \r \f \u000B \n \t \b \u0007 \u0006 \u0005 \u0004 \u0003 \u0002 \u0001 \u0000"});
     // clang-format on
 
-    assert(sb.length == strlen(expected));
-    assert(memcmp(sb.chars, expected, sb.length) == 0);
+    assert(json_string.length == strlen(expected));
+    assert(memcmp(json_string.chars, expected, json_string.length) == 0);
 
     const double *six_seven = json_get_number_s(root_obj, "67");
     assert(six_seven);
@@ -804,45 +868,46 @@ static void test_json_build_generate() {
 }
 
 static void test_json_lexer_simple_tokens() {
+    Arena arena;
     const char *text = "[] {}\r:,\ntrue\tfalse null";
     StringView sv = sv_on_c_string(text);
     Token t;
 
-    enum KuukiError err = json_lex_next_token(&t, &sv);
+    enum KuukiError err = json_lex_next_token(&arena, &t, &sv);
     assert(err == KUUKIE_OK);
-    assert(t.kind == BEGIN_ARRAY);
+    assert(t.kind == JSON_KIND_BEGIN_ARRAY);
 
-    err = json_lex_next_token(&t, &sv);
+    err = json_lex_next_token(&arena, &t, &sv);
     assert(err == KUUKIE_OK);
-    assert(t.kind == END_ARRAY);
+    assert(t.kind == JSON_KIND_END_ARRAY);
 
-    err = json_lex_next_token(&t, &sv);
+    err = json_lex_next_token(&arena, &t, &sv);
     assert(err == KUUKIE_OK);
-    assert(t.kind == BEGIN_OBJECT);
+    assert(t.kind == JSON_KIND_BEGIN_OBJECT);
 
-    err = json_lex_next_token(&t, &sv);
+    err = json_lex_next_token(&arena, &t, &sv);
     assert(err == KUUKIE_OK);
-    assert(t.kind == END_OBJECT);
+    assert(t.kind == JSON_KIND_END_OBJECT);
 
-    err = json_lex_next_token(&t, &sv);
+    err = json_lex_next_token(&arena, &t, &sv);
     assert(err == KUUKIE_OK);
-    assert(t.kind == NAME_SEPARATOR);
+    assert(t.kind == JSON_KIND_NAME_SEPARATOR);
 
-    err = json_lex_next_token(&t, &sv);
+    err = json_lex_next_token(&arena, &t, &sv);
     assert(err == KUUKIE_OK);
-    assert(t.kind == VALUE_SEPARATOR);
+    assert(t.kind == JSON_KIND_VALUE_SEPARATOR);
 
-    err = json_lex_next_token(&t, &sv);
+    err = json_lex_next_token(&arena, &t, &sv);
     assert(err == KUUKIE_OK);
-    assert(t.kind == BOOLEAN);
+    assert(t.kind == JSON_KIND_BOOLEAN);
     assert(t.boolean == true);
 
-    err = json_lex_next_token(&t, &sv);
+    err = json_lex_next_token(&arena, &t, &sv);
     assert(err == KUUKIE_OK);
-    assert(t.kind == BOOLEAN);
+    assert(t.kind == JSON_KIND_BOOLEAN);
     assert(t.boolean == false);
 
-    err = json_lex_next_token(&t, &sv);
+    err = json_lex_next_token(&arena, &t, &sv);
     assert(err == KUUKIE_OK);
     assert(t.kind == JSON_KIND_NULL);
 }
@@ -851,7 +916,7 @@ static void test_json_lexer_simple_tokens() {
     sv = sv_on_c_string(s);              \
     err = json_lex_next_number(&t, &sv); \
     assert(err == KUUKIE_OK);            \
-    assert(t.kind == NUMBER);            \
+    assert(t.kind == JSON_KIND_NUMBER);  \
     assert(t.number == x)
 
 #define ASSERT_LEX_NUMBER_FAIL(s)        \
@@ -906,27 +971,55 @@ static void test_json_lexer_numbers() {
     ASSERT_LEX_NUMBER_FAIL("1eX");
     ASSERT_LEX_NUMBER_FAIL("1E+a");
 
-    // Leading zero
-    ASSERT_LEX_NUMBER_FAIL("01");
-    ASSERT_LEX_NUMBER_FAIL("03.14");
-    ASSERT_LEX_NUMBER_FAIL("-099");
-
     // Values representable in floating point but not JSON
     ASSERT_LEX_NUMBER_FAIL("NaN");
     ASSERT_LEX_NUMBER_FAIL("INF");
     ASSERT_LEX_NUMBER_FAIL("Infinity");
 
-    // Limits number length to 63 - implementation detail, not specified
-    ASSERT_LEX_NUMBER("123456789012345678901234567890123456789012345678901234567890123", 1.2345678901234569e+62);
-    sv = sv_on_c_string("1234567890123456789012345678901234567890123456789012345678901234");
-    err = json_lex_next_number(&t, &sv);
-    assert(err == JSONE_NUMBER_LENGTH_LIMIT_EXCEEDED);
+    // Stops on end states - lexer or parser will fail on next token if invalid
+    ASSERT_LEX_NUMBER("01", 0);
+    assert(sv.length == 1);
+    ASSERT_LEX_NUMBER("1A", 1);
+    assert(sv.length == 1);
+    ASSERT_LEX_NUMBER("3.14A", 3.14);
+    assert(sv.length == 1);
+    ASSERT_LEX_NUMBER("1e9e", 1e9);
+    assert(sv.length == 1);
+}
+
+#define ASSERT_LEX_STRING(s, expected)           \
+    sv = sv_on_c_string(s);                      \
+    err = json_lex_next_string(&arena, &t, &sv); \
+    assert(err == KUUKIE_OK);                    \
+    assert(t.kind == JSON_KIND_STRING);          \
+    assert(sv_equals(sv_on_string(t.string), sv_on_c_string(expected)));
+
+#define ASSERT_LEX_STRING_FAIL(s, e)             \
+    sv = sv_on_c_string(s);                      \
+    err = json_lex_next_string(&arena, &t, &sv); \
+    assert(err == e)
+
+static void test_json_lexer_strings() {
+    Arena arena = arena_create(1024, 1);
+    StringView sv;
+    Token t;
+    enum KuukiError err = 0;
+
+    ASSERT_LEX_STRING("\"hello\"", "hello");
+    ASSERT_LEX_STRING("\"0123456789\"", "0123456789");
+    ASSERT_LEX_STRING("\"π 歌 𝄞 ⁶🤷‍♂️⁷ 👨‍👩‍👧‍👦🏴󠁧󠁢󠁥󠁮󠁧󠁿\"", "π 歌 𝄞 ⁶🤷‍♂️⁷ 👨‍👩‍👧‍👦🏴󠁧󠁢󠁥󠁮󠁧󠁿");
+    ASSERT_LEX_STRING("\"\\\" \\\\ \\b \\f \\n \\r \\t\"", "\" \\ \b \f \n \r \t");
+
+    ASSERT_LEX_STRING_FAIL("\"hello", JSONE_UNCLOSED_STRING);
+    ASSERT_LEX_STRING_FAIL("\"\\", JSONE_INVALID_ESCAPE);
+    ASSERT_LEX_STRING_FAIL("\"\\x\"", JSONE_INVALID_ESCAPE);
 }
 
 int main(int argc, char *argv[]) {
     test_json_build_generate();
     test_json_lexer_simple_tokens();
     test_json_lexer_numbers();
+    test_json_lexer_strings();
 }
 // Validate utf8 in parser ?
 // Diverge fom the RFC and disallow \u escapes besides 0x00-0x1F ?
