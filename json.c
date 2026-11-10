@@ -4,10 +4,10 @@
 #include <locale.h>
 #include <math.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <uchar.h>
 
 // ==================== General macros ====================
 
@@ -505,7 +505,7 @@ defer:
 
 static enum Error json_lex_next_token(Arena *arena, Token *token, StringView *sv) {
     while (sv->length > 0) {
-        const unsigned char c = *sv->chars;
+        const uint8_t c = *sv->chars;
         switch (c) {
             case '[':
                 *token = (Token){JSON_KIND_BEGIN_ARRAY};
@@ -680,32 +680,63 @@ static enum Error json_generate_number(StringBuilder *sb, const double number) {
 static enum Error json_generate_u_escape(StringBuilder *sb, const unsigned value) {
     char buf[7];
     snprintf(buf, 7, "\\u%.4X", value);
-    TRY(sb_append_sv(sb, sv_on_c_string(buf)));
-    return OK;
+    return sb_append_sv(sb, sv_on_c_string(buf));
+}
+
+// clang-format off
+static const uint8_t UTF8D[] = {
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, // 00..1f
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, // 20..3f
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, // 40..5f
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, // 60..7f
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9, // 80..9f
+    7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7, // a0..bf
+    8,8,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2, // c0..df
+    0xa,0x3,0x3,0x3,0x3,0x3,0x3,0x3,0x3,0x3,0x3,0x3,0x3,0x4,0x3,0x3, // e0..ef
+    0xb,0x6,0x6,0x6,0x5,0x8,0x8,0x8,0x8,0x8,0x8,0x8,0x8,0x8,0x8,0x8, // f0..ff
+    0x0,0x1,0x2,0x3,0x5,0x8,0x7,0x1,0x1,0x1,0x4,0x6,0x1,0x1,0x1,0x1, // s0..s0
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,1,1,1,1,1,0,1,0,1,1,1,1,1,1, // s1..s2
+    1,2,1,1,1,1,1,2,1,2,1,1,1,1,1,1,1,1,1,1,1,1,1,2,1,1,1,1,1,1,1,1, // s3..s4
+    1,2,1,1,1,1,1,1,1,2,1,1,1,1,1,1,1,1,1,1,1,1,1,3,1,3,1,1,1,1,1,1, // s5..s6
+    1,3,1,1,1,1,1,3,1,3,1,1,1,1,1,1,1,3,1,1,1,1,1,1,1,1,1,1,1,1,1,1, // s7..s8
+};
+// clang-format on
+
+// https://bjoern.hoehrmann.de/utf-8/decoder/dfa/ without calculating the code point
+static uint32_t utf8_validate(uint32_t *state, const uint32_t byte) {
+    const uint32_t type = UTF8D[byte];
+
+    *state = UTF8D[256 + *state * 16 + type];
+    return *state;
 }
 
 static enum Error json_generate_string(StringBuilder *sb, StringView sv) {
     TRY(sb_append_char(sb, '"'));
     while (sv.length > 0) {
-        const unsigned char c = *sv.chars;
-        const unsigned char escaped = PARSE_BACKSLASH_ESCAPE_MAP_INVERSE[c];
-        if (escaped) {
-            TRY(sb_append_char(sb, '\\'));
-            TRY(sb_append_char(sb, escaped));
+        if ((uint8_t)*sv.chars < 128) {
+            const uint8_t escaped = PARSE_BACKSLASH_ESCAPE_MAP_INVERSE[*sv.chars];
+            if (escaped) {
+                TRY(sb_append_char(sb, '\\'));
+                TRY(sb_append_char(sb, escaped));
+            } else if (*sv.chars < 32) {
+                TRY(json_generate_u_escape(sb, *sv.chars));
+            } else {
+                TRY(sb_append_char(sb, *sv.chars));
+            }
             sv_chop_left(&sv, 1);
         } else {
-            mbstate_t state = {0};
-            const size_t n = mbrtoc32(NULL, sv.chars, sv.length, &state);
-            if (n == (size_t)-1 || n == (size_t)-2 || n == (size_t)-3) { return JSONE_GEN_UTF8_INVALID; }
+            const uint8_t *s = (uint8_t *)sv.chars;
+            int n = 0;
+            uint32_t state = 0;
+            while (n++ < sv.length) {
+                if (!utf8_validate(&state, *s++)) break;
+            }
 
-            if (c < 32) {
-                // 0 means null byte which is fine
-                assert(n == 0 || n == 1);
-                TRY(json_generate_u_escape(sb, c));
-                sv_chop_left(&sv, 1);
-            } else {
-                for (int i = 0; i < n; ++i) { TRY(sb_append_char(sb, sv.chars[i])); }
+            if (state == 0) {
+                TRY(sb_append_sv(sb, (StringView){n, sv.chars}));
                 sv_chop_left(&sv, n);
+            } else {
+                return JSONE_GEN_UTF8_INVALID;
             }
         }
     }
@@ -879,13 +910,14 @@ static void test_json_build_generate() {
     json_arena_destroy(&arena);
 }
 
-#define ASSERT_GENERATE_STRING_ERR(sv, e)                      \
-    do {                                                       \
-        StringBuilder sb = sb_create_and_borrow_arena(&arena); \
-        enum Error err = json_generate_string(&sb, sv);        \
-        sb_complete_and_release_arena(&sb);                    \
-        assert(e == err);                                      \
-    } while (0)
+static const uint8_t INVALID_UTF_STRINGS[7][6] = {
+    {0b10100001},                                                  // continuation byte
+    {0b11100110, 0b10100001},                                      // unfinished utf8-3
+    {0b11100110, 0b10100001, 'a'},                                 // invalid continuation
+    {0b11100110, 0b10100001, 0b10000001, 0b10000001},              // too many con bytes
+    {0xC0, 0xBF},                                                  // overlong
+    {0xF4, 0x90, 0x80, 0x80},                                      // too big for Unicode
+    {0b1111100, 0b10000001, 0b10000001, 0b10000001, 0b10000001}};  // utf8-5
 
 static void test_json_generate_string_invalid() {
     // The main tests cover utf8 characters already, this covers invalid utf8 detection.
@@ -893,29 +925,12 @@ static void test_json_generate_string_invalid() {
 
     Arena arena = arena_create(1024, 1);
 
-    ASSERT_GENERATE_STRING_ERR(sv_on_c_string("hello"), OK);
-
-    const unsigned char isolated_continuation_byte[32] = {0b10100001};
-    ASSERT_GENERATE_STRING_ERR(sv_on_c_string((char *)isolated_continuation_byte), JSONE_GEN_UTF8_INVALID);
-
-    const unsigned char unfinished_utf8_3[32] = {0b11100110, 0b10100001};
-    ASSERT_GENERATE_STRING_ERR(sv_on_c_string((char *)unfinished_utf8_3), JSONE_GEN_UTF8_INVALID);
-
-    const unsigned char invalid_continuation[32] = {0b11100110, 0b10100001, 'a'};
-    ASSERT_GENERATE_STRING_ERR(sv_on_c_string((char *)invalid_continuation), JSONE_GEN_UTF8_INVALID);
-
-    const unsigned char too_many_continuation[32] = {0b11100110, 0b10100001, 0b10000001, 0b10000001};
-    ASSERT_GENERATE_STRING_ERR(sv_on_c_string((char *)too_many_continuation), JSONE_GEN_UTF8_INVALID);
-
-    const unsigned char overlong[32] = {0xC0, 0xBF};
-    ASSERT_GENERATE_STRING_ERR(sv_on_c_string((char *)overlong), JSONE_GEN_UTF8_INVALID);
-
-    // TODO better utf8
-    // const unsigned char too_big_for_unicode[32] = {0xF4, 0x90, 0x80, 0x80};
-    // ASSERT_GENERATE_STRING_ERR(sv_on_c_string((char *)too_big_for_unicode), JSONE_GEN_UTF8_INVALID);
-
-    const unsigned char five_bytes[32] = {0b1111100, 0b10000001, 0b10000001, 0b10000001, 0b10000001};
-    ASSERT_GENERATE_STRING_ERR(sv_on_c_string((char *)five_bytes), JSONE_GEN_UTF8_INVALID);
+    for (int i = 0; i < sizeof(INVALID_UTF_STRINGS) / sizeof(*INVALID_UTF_STRINGS); ++i) {
+        StringBuilder sb = sb_create_and_borrow_arena(&arena);
+        const enum Error err = json_generate_string(&sb, sv_on_c_string((char *)INVALID_UTF_STRINGS[i]));
+        sb_complete_and_release_arena(&sb);
+        assert(JSONE_GEN_UTF8_INVALID == err);
+    }
 
     arena_destroy(&arena);
 }
