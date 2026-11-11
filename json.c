@@ -303,6 +303,34 @@ enum Error json_object_add_member_s_s(JsonArena *arena, JsonObject *object, cons
     return json_object_add_member(arena, object, sv_on_c_string(name), json_string(str));
 }
 
+enum Error json_array_append(JsonArena *arena, JsonArray *array, const JsonValue value) {
+    if (array->capacity == 0) {
+        const int initial_capacity = 4;
+
+        array->elements = arena_alloc(&arena->structure, initial_capacity * sizeof(JsonValue));
+        if (!array->elements) return ARENA_FULL;
+
+        array->capacity = 4;
+    } else if (array->count >= array->capacity) {
+        const size_t old_size = array->capacity * sizeof(JsonValue);
+
+        // Arena has not grown so we can expand the existing allocation
+        if (arena->structure.data + arena->structure.used == array->elements + array->count) {
+            if (arena->structure.used + old_size > arena->structure.capacity) return ARENA_FULL;
+            arena->structure.used += old_size;
+            array->capacity *= 2;
+        } else {
+            JsonValue *new_elements = arena_realloc(&arena->structure, array->elements, old_size, 2 * old_size);
+            if (!new_elements) return ARENA_FULL;
+            array->elements = new_elements;
+            array->capacity *= 2;
+        }
+    }
+
+    array->elements[array->count++] = value;
+    return OK;
+}
+
 // ==================== Lexing JSON ====================
 
 enum JsonKind {
@@ -613,33 +641,7 @@ static enum Error json_lex_next_token(Arena *arena, Token *token, StringView *sv
     return OK;
 }
 
-enum Error json_array_append(JsonArena *arena, JsonArray *array, const JsonValue value) {
-    if (array->capacity == 0) {
-        const int initial_capacity = 4;
-
-        array->elements = arena_alloc(&arena->structure, initial_capacity * sizeof(JsonValue));
-        if (!array->elements) return ARENA_FULL;
-
-        array->capacity = 4;
-    } else if (array->count >= array->capacity) {
-        const size_t old_size = array->capacity * sizeof(JsonValue);
-
-        // Arena has not grown so we can expand the existing allocation
-        if (arena->structure.data + arena->structure.used == array->elements + array->count) {
-            if (arena->structure.used + old_size > arena->structure.capacity) return ARENA_FULL;
-            arena->structure.used += old_size;
-            array->capacity *= 2;
-        } else {
-            JsonValue *new_elements = arena_realloc(&arena->structure, array->elements, old_size, 2 * old_size);
-            if (!new_elements) return ARENA_FULL;
-            array->elements = new_elements;
-            array->capacity *= 2;
-        }
-    }
-
-    array->elements[array->count++] = value;
-    return OK;
-}
+// ==================== Parsing JSON ====================
 
 // ==================== Reading JSON structures ====================
 
