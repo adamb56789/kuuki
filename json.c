@@ -459,12 +459,38 @@ static enum Error json_lex_next_number(Token *token, StringView *sv) {
     }
 }
 
+// We allow / when parsing but no need to generate it
 static const char PARSE_BACKSLASH_ESCAPE_MAP[256] = {
-    ['"'] = '"', ['\\'] = '\\', ['b'] = '\b', ['f'] = '\f', ['n'] = '\n', ['r'] = '\r', ['t'] = '\t',
+    ['"'] = '"', ['\\'] = '\\', ['b'] = '\b', ['f'] = '\f', ['n'] = '\n', ['r'] = '\r', ['t'] = '\t', ['/'] = '/'};
+static const char GENERATE_BACKSLASH_ESCAPE_MAP[256] = {
+    ['"'] = '"', ['\\'] = '\\', ['\b'] = 'b', ['\f'] = 'f', ['\n'] = 'n', ['\r'] = 'r', ['\t'] = 't'};
+
+// clang-format off
+static const uint8_t UTF8D[] = {
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, // 00..1f
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, // 20..3f
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, // 40..5f
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, // 60..7f
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9, // 80..9f
+    7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7, // a0..bf
+    8,8,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2, // c0..df
+    0xa,0x3,0x3,0x3,0x3,0x3,0x3,0x3,0x3,0x3,0x3,0x3,0x3,0x4,0x3,0x3, // e0..ef
+    0xb,0x6,0x6,0x6,0x5,0x8,0x8,0x8,0x8,0x8,0x8,0x8,0x8,0x8,0x8,0x8, // f0..ff
+    0x0,0x1,0x2,0x3,0x5,0x8,0x7,0x1,0x1,0x1,0x4,0x6,0x1,0x1,0x1,0x1, // s0..s0
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,1,1,1,1,1,0,1,0,1,1,1,1,1,1, // s1..s2
+    1,2,1,1,1,1,1,2,1,2,1,1,1,1,1,1,1,1,1,1,1,1,1,2,1,1,1,1,1,1,1,1, // s3..s4
+    1,2,1,1,1,1,1,1,1,2,1,1,1,1,1,1,1,1,1,1,1,1,1,3,1,3,1,1,1,1,1,1, // s5..s6
+    1,3,1,1,1,1,1,3,1,3,1,1,1,1,1,1,1,3,1,1,1,1,1,1,1,1,1,1,1,1,1,1, // s7..s8
 };
-static const char PARSE_BACKSLASH_ESCAPE_MAP_INVERSE[256] = {
-    ['"'] = '"', ['\\'] = '\\', ['\b'] = 'b', ['\f'] = 'f', ['\n'] = 'n', ['\r'] = 'r', ['\t'] = 't',
-};
+// clang-format on
+
+// https://bjoern.hoehrmann.de/utf-8/decoder/dfa/ without calculating the code point
+static uint32_t utf8_validate(uint32_t *state, const uint32_t byte) {
+    const uint32_t type = UTF8D[byte];
+
+    *state = UTF8D[256 + *state * 16 + type];
+    return *state;
+}
 
 static enum Error json_lex_next_string(Arena *arena, Token *token, StringView *sv) {
     if (*sv->chars != '"') return JSONE_PARSE_TOKEN_UNRECOGNIZED;
@@ -480,21 +506,39 @@ static enum Error json_lex_next_string(Arena *arena, Token *token, StringView *s
             const String string = sb_complete_and_release_arena(&sb);
             *token = (Token){JSON_KIND_STRING, .string = string};
 
-            return OK;
+            DEFER(OK);
         }
 
         if (*sv->chars == '\\') {
-            sv_chop_left(sv, 1);
-            if (sv->length == 0) DEFER(JSONE_PARSE_BACKLASH_ESCAPE_INVALID);
+            // Backslash escape cannot be cut off by EOF
+            if (sv->length < 2) DEFER(JSONE_PARSE_BACKLASH_ESCAPE_INVALID);
 
-            const char c = PARSE_BACKSLASH_ESCAPE_MAP[*sv->chars];
+            // Valid escapes are "\bfnrt/
+            const char c = PARSE_BACKSLASH_ESCAPE_MAP[sv->chars[1]];
             if (c == 0) DEFER(JSONE_PARSE_BACKLASH_ESCAPE_INVALID);
 
-            sb_append_char(&sb, c);
+            TRY(sb_append_char(&sb, c));
+            sv_chop_left(sv, 2);
+        } else if ((uint8_t)*sv->chars < 128) {
+            // Control characters must be escaped and cannot be directly in strings
+            if (*sv->chars < 32) DEFER(JSONE_PARSE_CONTROL_CHARACTER_UNESCAPED);
+
+            TRY(sb_append_char(&sb, *sv->chars));
             sv_chop_left(sv, 1);
         } else {
-            sb_append_char(&sb, *sv->chars);
-            sv_chop_left(sv, 1);
+            const uint8_t *s = (uint8_t *)sv->chars;
+            int length = 0;
+            uint32_t state = 0;
+            while (length++ < sv->length) {
+                if (!utf8_validate(&state, *s++)) break;
+            }
+
+            if (state == 0) {  // OK
+                TRY(sb_append_sv(&sb, (StringView){length, sv->chars}));
+                sv_chop_left(sv, length);
+            } else {
+                DEFER(JSONE_PARSE_UTF8_INVALID);
+            }
         }
     }
     err = JSONE_PARSE_STRING_UNCLOSED;
@@ -683,38 +727,11 @@ static enum Error json_generate_u_escape(StringBuilder *sb, const unsigned value
     return sb_append_sv(sb, sv_on_c_string(buf));
 }
 
-// clang-format off
-static const uint8_t UTF8D[] = {
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, // 00..1f
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, // 20..3f
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, // 40..5f
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, // 60..7f
-    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9, // 80..9f
-    7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7, // a0..bf
-    8,8,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2, // c0..df
-    0xa,0x3,0x3,0x3,0x3,0x3,0x3,0x3,0x3,0x3,0x3,0x3,0x3,0x4,0x3,0x3, // e0..ef
-    0xb,0x6,0x6,0x6,0x5,0x8,0x8,0x8,0x8,0x8,0x8,0x8,0x8,0x8,0x8,0x8, // f0..ff
-    0x0,0x1,0x2,0x3,0x5,0x8,0x7,0x1,0x1,0x1,0x4,0x6,0x1,0x1,0x1,0x1, // s0..s0
-    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,1,1,1,1,1,0,1,0,1,1,1,1,1,1, // s1..s2
-    1,2,1,1,1,1,1,2,1,2,1,1,1,1,1,1,1,1,1,1,1,1,1,2,1,1,1,1,1,1,1,1, // s3..s4
-    1,2,1,1,1,1,1,1,1,2,1,1,1,1,1,1,1,1,1,1,1,1,1,3,1,3,1,1,1,1,1,1, // s5..s6
-    1,3,1,1,1,1,1,3,1,3,1,1,1,1,1,1,1,3,1,1,1,1,1,1,1,1,1,1,1,1,1,1, // s7..s8
-};
-// clang-format on
-
-// https://bjoern.hoehrmann.de/utf-8/decoder/dfa/ without calculating the code point
-static uint32_t utf8_validate(uint32_t *state, const uint32_t byte) {
-    const uint32_t type = UTF8D[byte];
-
-    *state = UTF8D[256 + *state * 16 + type];
-    return *state;
-}
-
 static enum Error json_generate_string(StringBuilder *sb, StringView sv) {
     TRY(sb_append_char(sb, '"'));
     while (sv.length > 0) {
         if ((uint8_t)*sv.chars < 128) {
-            const uint8_t escaped = PARSE_BACKSLASH_ESCAPE_MAP_INVERSE[*sv.chars];
+            const uint8_t escaped = GENERATE_BACKSLASH_ESCAPE_MAP[*sv.chars];
             if (escaped) {
                 TRY(sb_append_char(sb, '\\'));
                 TRY(sb_append_char(sb, escaped));
@@ -726,15 +743,15 @@ static enum Error json_generate_string(StringBuilder *sb, StringView sv) {
             sv_chop_left(&sv, 1);
         } else {
             const uint8_t *s = (uint8_t *)sv.chars;
-            int n = 0;
+            int length = 0;
             uint32_t state = 0;
-            while (n++ < sv.length) {
+            while (length++ < sv.length) {
                 if (!utf8_validate(&state, *s++)) break;
             }
 
-            if (state == 0) {
-                TRY(sb_append_sv(sb, (StringView){n, sv.chars}));
-                sv_chop_left(&sv, n);
+            if (state == 0) {  // OK
+                TRY(sb_append_sv(sb, (StringView){length, sv.chars}));
+                sv_chop_left(&sv, length);
             } else {
                 return JSONE_GEN_UTF8_INVALID;
             }
@@ -1080,11 +1097,23 @@ static void test_json_lexer_strings() {
     ASSERT_LEX_STRING("\"0123456789\"", "0123456789");
     ASSERT_LEX_STRING("\"π 歌 𝄞 ⁶🤷‍♂️⁷ 👨‍👩‍👧‍👦🏴󠁧󠁢󠁥󠁮󠁧󠁿\"",
                       "π 歌 𝄞 ⁶🤷‍♂️⁷ 👨‍👩‍👧‍👦🏴󠁧󠁢󠁥󠁮󠁧󠁿");
-    ASSERT_LEX_STRING("\"\\\" \\\\ \\b \\f \\n \\r \\t\"", "\" \\ \b \f \n \r \t");
+    ASSERT_LEX_STRING("\"\\\" \\\\ \\b \\f \\n \\r \\t \\/\"", "\" \\ \b \f \n \r \t /");
 
     ASSERT_LEX_STRING_FAIL("\"hello", JSONE_PARSE_STRING_UNCLOSED);
     ASSERT_LEX_STRING_FAIL("\"\\", JSONE_PARSE_BACKLASH_ESCAPE_INVALID);
     ASSERT_LEX_STRING_FAIL("\"\\x\"", JSONE_PARSE_BACKLASH_ESCAPE_INVALID);
+    ASSERT_LEX_STRING_FAIL("\"\b\"", JSONE_PARSE_CONTROL_CHARACTER_UNESCAPED);
+    ASSERT_LEX_STRING_FAIL("\"\x1\"", JSONE_PARSE_CONTROL_CHARACTER_UNESCAPED);
+
+    for (int i = 0; i < sizeof(INVALID_UTF_STRINGS) / sizeof(*INVALID_UTF_STRINGS); ++i) {
+        StringBuilder sb = sb_create_and_borrow_arena(&arena);
+        sb_append_char(&sb, '"');
+        sb_append_sv(&sb, sv_on_c_string((char *)INVALID_UTF_STRINGS[i]));
+        sb_append_char(&sb, '"');
+        sb_append_char(&sb, 0);
+        String s = sb_complete_and_release_arena(&sb);
+        ASSERT_LEX_STRING_FAIL(s.chars, JSONE_PARSE_UTF8_INVALID);
+    }
 
     arena_destroy(&arena);
 }
