@@ -7,6 +7,10 @@ string(APPEND CMAKE_C_FLAGS_RELEASE " -march=native -g")
 
 add_executable(json json.c)
 target_link_libraries(json PRIVATE m)
+target_compile_options(json PRIVATE
+        -Werror=attribute-warning
+        -Werror=format
+)
 
 add_executable(get_latest_data get_latest_data.c)
 

@@ -34,9 +34,10 @@ enum Error {
     JSONE_PARSE_OBJECT_SEPARATOR_MISSING,
     JSONE_PARSE_OBJECT_NAME_MISSING,
     JSONE_PARSE_NAME_SEPARATOR_MISSING,
+    JSONE_PARSE_DEPTH_LIMIT_EXCEEDED,
 };
 
-char *error_get_name(const enum Error err) {
+char *error_get_message(const enum Error err) {
     switch (err) {
         case OK:
             return "OK";
@@ -72,18 +73,20 @@ char *error_get_name(const enum Error err) {
             return "object members must start with a name";
         case JSONE_PARSE_NAME_SEPARATOR_MISSING:
             return "object member names must be followed by a ':'";
+        case JSONE_PARSE_DEPTH_LIMIT_EXCEEDED:
+            return "depth limit exceeded";
         default:
             return "Error code not recognized";
     }
 }
 
-#define TRY(expr)                                  \
-    do {                                           \
-        enum Error try_err = (expr);               \
-        if (try_err != OK) {                       \
-            LOG_WARN("Caught error: %d", try_err); \
-            return try_err;                        \
-        }                                          \
+#define TRY(expr)                                                          \
+    do {                                                                   \
+        enum Error try_err = (expr);                                       \
+        if (try_err != OK) {                                               \
+            LOG_WARN("Error %d: %s", try_err, error_get_message(try_err)); \
+            return try_err;                                                \
+        }                                                                  \
     } while (0)
 
 #define DEFER(code) \
@@ -183,6 +186,8 @@ enum Error copy_c_string_to_string(Arena *string_arena, const char *c_string, St
     return copy_sv_to_string(string_arena, sv_on_c_string(c_string), string);
 }
 
+enum Error sv_create_formatted(Arena *string_arena, StringView *sv, const char *format, ...)
+    __attribute__((format(printf, 3, 4)));
 enum Error sv_create_formatted(Arena *string_arena, StringView *sv, const char *format, ...) {
     va_list args, args_copy;
     va_start(args, format);
@@ -190,8 +195,6 @@ enum Error sv_create_formatted(Arena *string_arena, StringView *sv, const char *
     va_copy(args_copy, args);
     const int len = vsnprintf(NULL, 0, format, args_copy);
     va_end(args_copy);
-
-    assert(len >= 0);
 
     char *dest = arena_alloc(string_arena, len + 1);
     if (!dest) {
@@ -259,6 +262,26 @@ enum Error sb_append_sv(StringBuilder *sb, const StringView sv) {
     if (sb->length + sv.length > sb->capacity) return ARENA_FULL;
     memcpy(sb->chars + sb->length, sv.chars, sv.length);
     sb->length += sv.length;
+    return OK;
+}
+
+enum Error sb_append_formatted(StringBuilder *sb, const char *format, ...) __attribute__((format(printf, 2, 3)));
+enum Error sb_append_formatted(StringBuilder *sb, const char *format, ...) {
+    va_list args, args_copy;
+    va_start(args, format);
+
+    va_copy(args_copy, args);
+    const int len = vsnprintf(NULL, 0, format, args_copy);
+    va_end(args_copy);
+
+    // We need space for the null-terminator produced by printf
+    if (sb->length + len + 1 > sb->capacity) return ARENA_FULL;
+
+    vsnprintf(sb->chars + sb->length, len + 1, format, args);
+    va_end(args);
+
+    // Don't include the null-terminator in the resulting string
+    sb->length += len;
     return OK;
 }
 
@@ -562,6 +585,7 @@ static const char PARSE_BACKSLASH_ESCAPE_MAP[256] = {
 static const char GENERATE_BACKSLASH_ESCAPE_MAP[256] = {
     ['"'] = '"', ['\\'] = '\\', ['\b'] = 'b', ['\f'] = 'f', ['\n'] = 'n', ['\r'] = 'r', ['\t'] = 't'};
 
+// region UTF8 decode state machine table
 // clang-format off
 static const uint8_t UTF8D[] = {
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, // 00..1f
@@ -580,6 +604,7 @@ static const uint8_t UTF8D[] = {
     1,3,1,1,1,1,1,3,1,3,1,1,1,1,1,1,1,3,1,1,1,1,1,1,1,1,1,1,1,1,1,1, // s7..s8
 };
 // clang-format on
+// endregion
 
 // https://bjoern.hoehrmann.de/utf-8/decoder/dfa/ without calculating the code point
 static uint32_t utf8_validate(uint32_t *state, const uint32_t byte) {
@@ -730,6 +755,8 @@ static enum Error json_lex_next_token(Arena *string_arena, Token *token, StringV
 
 // ==================== Parsing JSON ====================
 
+static const int JSON_DEPTH_LIMIT = 32;
+
 typedef struct JsonParserState {
     JsonArena *arena;
     StringView *error_message;
@@ -739,7 +766,7 @@ typedef struct JsonParserState {
 
 static enum Error json_parser_handle_error(const JsonParserState parser, const enum Error err) {
     TRY(sv_create_formatted(&parser.arena->strings, parser.error_message, "Invalid JSON at byte %zu: %s",
-                            parser.json_length - parser.json_sv->length, error_get_name(err)));
+                            parser.json_length - parser.json_sv->length, error_get_message(err)));
     return err;
 }
 
@@ -749,7 +776,9 @@ static enum Error json_parser_consume(const JsonParserState parser, Token *token
     return OK;
 }
 
-static enum Error json_parse_value(const JsonParserState parser, JsonValue *result, const Token *value_token) {
+static enum Error json_parse_value(const JsonParserState parser, JsonValue *result, const Token *value_token,
+                                   const int depth) {
+    if (depth > JSON_DEPTH_LIMIT) return JSONE_PARSE_DEPTH_LIMIT_EXCEEDED;
     switch (value_token->kind) {
         case JSON_KIND_BEGIN_ARRAY: {
             JsonArray array = {0};
@@ -761,7 +790,7 @@ static enum Error json_parse_value(const JsonParserState parser, JsonValue *resu
                 if (element_token.kind == JSON_KIND_END_ARRAY) break;
 
                 JsonValue element_value;
-                TRY(json_parse_value(parser, &element_value, &element_token));
+                TRY(json_parse_value(parser, &element_value, &element_token, depth + 1));
                 json_array_append(parser.arena, &array, element_value);
 
                 Token seperator_token;
@@ -798,7 +827,7 @@ static enum Error json_parse_value(const JsonParserState parser, JsonValue *resu
                 TRY(json_parser_consume(parser, &member_token));
 
                 JsonValue member_value;
-                TRY(json_parse_value(parser, &member_value, &member_token));
+                TRY(json_parse_value(parser, &member_value, &member_token, depth + 1));
                 json_object_add_member(parser.arena, &object, name_token.string, member_value);
 
                 Token value_seperator_token;
@@ -839,7 +868,7 @@ enum Error json_parse(JsonArena *arena, JsonValue **result, StringView *error_me
     JsonValue *v = arena_alloc(&arena->structure, sizeof(JsonValue));
     if (!v) return ARENA_FULL;
 
-    TRY(json_parse_value(parser, v, &token));
+    TRY(json_parse_value(parser, v, &token, 0));
 
     *result = v;
     return OK;
@@ -847,45 +876,45 @@ enum Error json_parse(JsonArena *arena, JsonValue **result, StringView *error_me
 
 // ==================== Reading JSON structures ====================
 
-const JsonMember *json_get(const JsonObject *object, const StringView name) {
+const JsonValue *json_get(const JsonObject *object, const StringView name) {
     for (size_t i = 0; i < object->count; ++i) {
-        if (sv_equals(name, sv_on_string(object->members[i].name))) return &object->members[i];
+        if (sv_equals(name, sv_on_string(object->members[i].name))) return &object->members[i].value;
     }
     return NULL;
 }
 
 const JsonObject *json_get_object(const JsonObject *object, const StringView name) {
-    const JsonMember *m = json_get(object, name);
+    const JsonValue *m = json_get(object, name);
     if (!m) return NULL;
-    if (m->value.type == JSON_OBJECT) return &m->value.object;
+    if (m->type == JSON_OBJECT) return &m->object;
     return NULL;
 }
 const JsonArray *json_get_array(const JsonObject *object, const StringView name) {
-    const JsonMember *m = json_get(object, name);
+    const JsonValue *m = json_get(object, name);
     if (!m) return NULL;
-    if (m->value.type == JSON_ARRAY) return &m->value.array;
+    if (m->type == JSON_ARRAY) return &m->array;
     return NULL;
 }
 const StringView *json_get_string(const JsonObject *object, const StringView name) {
-    const JsonMember *m = json_get(object, name);
+    const JsonValue *m = json_get(object, name);
     if (!m) return NULL;
-    if (m->value.type == JSON_STRING) return &m->value.string;
+    if (m->type == JSON_STRING) return &m->string;
     return NULL;
 }
 const double *json_get_number(const JsonObject *object, const StringView name) {
-    const JsonMember *m = json_get(object, name);
+    const JsonValue *m = json_get(object, name);
     if (!m) return NULL;
-    if (m->value.type == JSON_NUMBER) return &m->value.number;
+    if (m->type == JSON_NUMBER) return &m->number;
     return NULL;
 }
 const bool *json_get_bool(const JsonObject *object, const StringView name) {
-    const JsonMember *m = json_get(object, name);
+    const JsonValue *m = json_get(object, name);
     if (!m) return NULL;
-    if (m->value.type == JSON_BOOLEAN) return &m->value.boolean;
+    if (m->type == JSON_BOOLEAN) return &m->boolean;
     return NULL;
 }
 
-const JsonMember *json_get_s(const JsonObject *object, const char *name) {
+const JsonValue *json_get_s(const JsonObject *object, const char *name) {
     return json_get(object, sv_on_c_string(name));
 }
 
@@ -913,23 +942,6 @@ static enum Error json_generate_indentation(StringBuilder *sb, const int indent_
     return OK;
 }
 
-static enum Error json_generate_number(StringBuilder *sb, const double number) {
-    if (!isfinite(number)) return JSONE_GEN_NUM_INVALID;
-
-    // Need temporary space because snprintf includes null-terminator
-    // DBL_DECIMAL_DIG digits + decimal point + `E+XXX` + null-terminator
-    char temp_number_buffer[32];
-    snprintf(temp_number_buffer, sizeof(temp_number_buffer), "%.*G", DBL_DECIMAL_DIG, number);
-    TRY(sb_append_sv(sb, sv_on_c_string(temp_number_buffer)));
-    return OK;
-}
-
-static enum Error json_generate_u_escape(StringBuilder *sb, const unsigned value) {
-    char buf[7];
-    snprintf(buf, 7, "\\u%.4X", value);
-    return sb_append_sv(sb, sv_on_c_string(buf));
-}
-
 static enum Error json_generate_string(StringBuilder *sb, StringView sv) {
     TRY(sb_append_char(sb, '"'));
     while (sv.length > 0) {
@@ -939,7 +951,7 @@ static enum Error json_generate_string(StringBuilder *sb, StringView sv) {
                 TRY(sb_append_char(sb, '\\'));
                 TRY(sb_append_char(sb, escaped));
             } else if (*sv.chars < 32) {
-                TRY(json_generate_u_escape(sb, *sv.chars));
+                TRY(sb_append_formatted(sb, "\\u%.4X", *sv.chars));
             } else {
                 TRY(sb_append_char(sb, *sv.chars));
             }
@@ -965,7 +977,7 @@ static enum Error json_generate_string(StringBuilder *sb, StringView sv) {
 }
 
 static enum Error json_generate_inner(StringBuilder *sb, const JsonValue *value, const int pretty, const int depth) {
-    if (depth >= 32) return JSONE_GEN_DEPTH_LIMIT_EXCEEDED;
+    if (depth > JSON_DEPTH_LIMIT) return JSONE_GEN_DEPTH_LIMIT_EXCEEDED;
     switch (value->type) {
         case JSON_OBJECT:
             TRY(sb_append_char(sb, '{'));
@@ -1004,17 +1016,14 @@ static enum Error json_generate_inner(StringBuilder *sb, const JsonValue *value,
             TRY(sb_append_char(sb, ']'));
             break;
         case JSON_NUMBER:
-            TRY(json_generate_number(sb, value->number));
-            break;
+            if (!isfinite(value->number)) return JSONE_GEN_NUM_INVALID;
+            return sb_append_formatted(sb, "%.*G", DBL_DECIMAL_DIG, value->number);
         case JSON_STRING:
-            TRY(json_generate_string(sb, value->string));
-            break;
+            return json_generate_string(sb, value->string);
         case JSON_BOOLEAN:
-            TRY(sb_append_sv(sb, sv_on_c_string(value->boolean ? "true" : "false")));
-            break;
+            return sb_append_sv(sb, sv_on_c_string(value->boolean ? "true" : "false"));
         case JSON_NULL:
-            TRY(sb_append_sv(sb, sv_on_c_string("null")));
-            break;
+            return sb_append_sv(sb, sv_on_c_string("null"));
     }
     return OK;
 }
@@ -1427,6 +1436,18 @@ static void test_json_parse() {
         const StringView output_string = sb_complete_and_release_arena(&sb);
         assert(sv_equals(sv_on_c_string(TEST_JSON_STRING), output_string));
     }
+    {
+        StringView test_string =
+            sv_on_c_string("[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]");
+        const enum Error err = json_parse(&arena, &v, &error_message, &test_string);
+        assert(err == OK);
+    }
+    {
+        StringView test_string =
+            sv_on_c_string("[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]");
+        const enum Error err = json_parse(&arena, &v, &error_message, &test_string);
+        assert(err == JSONE_PARSE_DEPTH_LIMIT_EXCEEDED);
+    }
 
     json_arena_destroy(&arena);
 }
@@ -1442,4 +1463,8 @@ int main(int argc, char *argv[]) {
     test_json_parse();
 }
 
-// TODO parsing depth limit
+// TODO parsing fail tests
+// TODO accept all valid hex codes
+// TODO null pointer handling?
+
+// Valid code points: 0x0000 <= cp <= 0xD7FF and 0xE000 <= cp <= 0x10FFFF
