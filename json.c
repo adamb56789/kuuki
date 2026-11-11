@@ -1,7 +1,6 @@
 #include <assert.h>
 #include <ctype.h>
 #include <float.h>
-#include <locale.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -704,7 +703,7 @@ const bool *json_get_bool_s(const JsonObject *object, const char *name) {
 
 // ==================== Generating JSON from a structure ====================
 
-static enum Error json_generate_indent(StringBuilder *sb, const int indent_width, const int depth) {
+static enum Error json_generate_indentation(StringBuilder *sb, const int indent_width, const int depth) {
     TRY(sb_append_char(sb, '\n'));
     for (int i = 0; i < indent_width * depth; ++i) { TRY(sb_append_char(sb, ' ')); }
     return OK;
@@ -767,7 +766,7 @@ static enum Error json_generate_inner(StringBuilder *sb, const JsonValue *value,
         case JSON_OBJECT:
             TRY(sb_append_char(sb, '{'));
             for (size_t i = 0; i < value->object.count; ++i) {
-                if (pretty > 0) TRY(json_generate_indent(sb, pretty, depth + 1));
+                if (pretty > 0) TRY(json_generate_indentation(sb, pretty, depth + 1));
 
                 const JsonMember member = value->object.members[i];
 
@@ -782,21 +781,21 @@ static enum Error json_generate_inner(StringBuilder *sb, const JsonValue *value,
                 // Last in object has no comma
                 if (i != value->object.count - 1) TRY(sb_append_char(sb, ','));
             }
-            if (pretty > 0 && value->object.count > 0) TRY(json_generate_indent(sb, pretty, depth));
+            if (pretty > 0 && value->object.count > 0) TRY(json_generate_indentation(sb, pretty, depth));
 
             TRY(sb_append_char(sb, '}'));
             break;
         case JSON_ARRAY:
             TRY(sb_append_char(sb, '['));
             for (size_t i = 0; i < value->array.count; ++i) {
-                if (pretty > 0) TRY(json_generate_indent(sb, pretty, depth + 1));
+                if (pretty > 0) TRY(json_generate_indentation(sb, pretty, depth + 1));
 
                 TRY(json_generate_inner(sb, value->array.elements + i, pretty, depth + 1));
 
                 // Last in array has no comma
                 if (i != value->array.count - 1) TRY(sb_append_char(sb, ','));
             }
-            if (pretty > 0 && value->array.count > 0) TRY(json_generate_indent(sb, pretty, depth));
+            if (pretty > 0 && value->array.count > 0) TRY(json_generate_indentation(sb, pretty, depth));
 
             TRY(sb_append_char(sb, ']'));
             break;
@@ -816,7 +815,9 @@ static enum Error json_generate_inner(StringBuilder *sb, const JsonValue *value,
     return OK;
 }
 
-enum Error json_generate(StringBuilder *sb, const JsonValue *value, const int pretty_width) {
+enum Error json_generate(StringBuilder *sb, const JsonValue *value) { return json_generate_inner(sb, value, 0, 0); }
+
+enum Error json_generate_pretty(StringBuilder *sb, const JsonValue *value, const int pretty_width) {
     return json_generate_inner(sb, value, pretty_width, 0);
 }
 
@@ -897,7 +898,7 @@ static void test_json_build_generate() {
 
     StringBuilder sb = sb_create_and_borrow_arena(&arena.strings);
 
-    const enum Error err = json_generate(&sb, &root_val, 0);
+    const enum Error err = json_generate(&sb, &root_val);
     assert(err == OK);
 
     String json_string = sb_complete_and_release_arena(&sb);
@@ -927,14 +928,15 @@ static void test_json_build_generate() {
     json_arena_destroy(&arena);
 }
 
-static const uint8_t INVALID_UTF_STRINGS[7][6] = {
-    {0b10100001},                                                  // continuation byte
-    {0b11100110, 0b10100001},                                      // unfinished utf8-3
-    {0b11100110, 0b10100001, 'a'},                                 // invalid continuation
-    {0b11100110, 0b10100001, 0b10000001, 0b10000001},              // too many con bytes
-    {0xC0, 0xBF},                                                  // overlong
-    {0xF4, 0x90, 0x80, 0x80},                                      // too big for Unicode
-    {0b1111100, 0b10000001, 0b10000001, 0b10000001, 0b10000001}};  // utf8-5
+static const uint8_t INVALID_UTF_STRINGS[][6] = {
+    {0b10100001},                                                 // continuation byte
+    {0b11100110, 0b10100001},                                     // unfinished utf8-3
+    {0b11100110, 0b10100001, 'a'},                                // invalid continuation
+    {0b11100110, 0b10100001, 0b10000001, 0b10000001},             // too many con bytes
+    {0xC0, 0xBF},                                                 // overlong
+    {0xF4, 0x90, 0x80, 0x80},                                     // too big for Unicode
+    {0b1111100, 0b10000001, 0b10000001, 0b10000001, 0b10000001},  // utf8-5
+};
 
 static void test_json_generate_string_invalid() {
     // The main tests cover utf8 characters already, this covers invalid utf8 detection.
@@ -997,113 +999,126 @@ static void test_json_lexer_simple_tokens() {
     assert(t.kind == JSON_KIND_NULL);
 }
 
-#define ASSERT_LEX_NUMBER(s, x, remaining)              \
-    do {                                                \
-        StringView sv = sv_on_c_string(s);              \
-        Token t;                                        \
-        enum Error err = json_lex_next_number(&t, &sv); \
-        assert(err == OK);                              \
-        assert(t.kind == JSON_KIND_NUMBER);             \
-        assert(t.number == x);                          \
-        assert(sv.length == remaining);                 \
-    } while (0)
-
-#define ASSERT_LEX_NUMBER_FAIL(s)                       \
-    do {                                                \
-        StringView sv = sv_on_c_string(s);              \
-        Token t;                                        \
-        enum Error err = json_lex_next_number(&t, &sv); \
-        assert(err == JSONE_PARSE_TOKEN_UNRECOGNIZED);  \
-    } while (0)
-
 static void test_json_lexer_numbers() {
-    // Valid JSON numbers
-    ASSERT_LEX_NUMBER("0", 0, 0);
-    ASSERT_LEX_NUMBER("-0", 0, 0);
-    ASSERT_LEX_NUMBER("67", 67, 0);
-    ASSERT_LEX_NUMBER("0.0", 0.0, 0);
-    ASSERT_LEX_NUMBER("-0.0", -0.0, 0);
-    ASSERT_LEX_NUMBER("3.14", 3.14, 0);
-    ASSERT_LEX_NUMBER("1e9", 1e9, 0);
-    ASSERT_LEX_NUMBER("6.02E+23", 6.02e+23, 0);
-    ASSERT_LEX_NUMBER("6.02E+23 hello", 6.02e+23, 6);
-    ASSERT_LEX_NUMBER("1.67e-27", 1.67e-27, 0);
-    ASSERT_LEX_NUMBER("-123e45", -123e45, 0);
+    struct TestCaseSuccess {
+        char *string;
+        double expected_number;
+        size_t expected_length_remaining;
+    };
 
-    // Parse double precision - no particular precision required by the RFC, but it is advised
-    ASSERT_LEX_NUMBER("3.141592653589793238462643383279", 3.1415926535897931, 0);
+    const struct TestCaseSuccess success_cases[] = {
+        // Valid JSON numbers
+        {"0", 0, 0},
+        {"-0", 0, 0},
+        {"67", 67, 0},
+        {"0.0", 0.0, 0},
+        {"-0.0", -0.0, 0},
+        {"3.14", 3.14, 0},
+        {"1e9", 1e9, 0},
+        {"6.02E+23", 6.02e+23, 0},
+        {"6.02E+23 hello", 6.02e+23, 6},
+        {"1.67e-27", 1.67e-27, 0},
+        {"-123e45", -123e45, 0},
+        // Parse double precision - no particular precision required by the RFC, but it is advised
+        {"3.141592653589793238462643383279", 3.1415926535897931, 0},
+        // Stops on end states - lexer or parser will fail on next token if invalid
+        {"01", 0, 1},
+        {"1A", 1, 1},
+        {"3.14A", 3.14, 1},
+        {"1e9e", 1e9, 1}};
 
-    // Empty string
-    ASSERT_LEX_NUMBER_FAIL("");
+    for (int i = 0; i < sizeof(success_cases) / sizeof(*success_cases); ++i) {
+        struct TestCaseSuccess test = success_cases[i];
+        StringView sv = sv_on_c_string(test.string);
+        Token t;
+        const enum Error err = json_lex_next_number(&t, &sv);
+        assert(err == OK);
+        assert(t.kind == JSON_KIND_NUMBER);
+        assert(t.number == test.expected_number);
+        assert(sv.length == test.expected_length_remaining);
+    }
 
-    // Starts with invalid character
-    ASSERT_LEX_NUMBER_FAIL("X");
-    ASSERT_LEX_NUMBER_FAIL(" ");
-    ASSERT_LEX_NUMBER_FAIL("*");
-    ASSERT_LEX_NUMBER_FAIL("/");
+    const char fail_cases[][10] = {
+        // Empty string
+        "",
+        // Starts with invalid character
+        "X",
+        " ",
+        "*",
+        "/",
+        // Invalid starts that are valid elsewhere in numbers
+        "+",
+        "e9",
+        ".25",
+        // Invalid sign placements
+        "-",
+        "--1",
+        "+-1",
+        "-+1",
+        // Malformed exponents
+        "1e",
+        "1e+",
+        "1e-",
+        "1eX",
+        "1E+a",
+        // Values representable in floating point but not JSON
+        "NaN",
+        "INF",
+        "Infinity",
+    };
 
-    // Invalid starts that are valid elsewhere in numbers
-    ASSERT_LEX_NUMBER_FAIL("+");
-    ASSERT_LEX_NUMBER_FAIL("e9");
-    ASSERT_LEX_NUMBER_FAIL(".25");
-
-    // Invalid sign placements
-    ASSERT_LEX_NUMBER_FAIL("-");
-    ASSERT_LEX_NUMBER_FAIL("--1");
-    ASSERT_LEX_NUMBER_FAIL("+-1");
-    ASSERT_LEX_NUMBER_FAIL("-+1");
-
-    // Malformed exponents
-    ASSERT_LEX_NUMBER_FAIL("1e");
-    ASSERT_LEX_NUMBER_FAIL("1e+");
-    ASSERT_LEX_NUMBER_FAIL("1e-");
-    ASSERT_LEX_NUMBER_FAIL("1eX");
-    ASSERT_LEX_NUMBER_FAIL("1E+a");
-
-    // Values representable in floating point but not JSON
-    ASSERT_LEX_NUMBER_FAIL("NaN");
-    ASSERT_LEX_NUMBER_FAIL("INF");
-    ASSERT_LEX_NUMBER_FAIL("Infinity");
-
-    // Stops on end states - lexer or parser will fail on next token if invalid
-    ASSERT_LEX_NUMBER("01", 0, 1);
-    ASSERT_LEX_NUMBER("1A", 1, 1);
-    ASSERT_LEX_NUMBER("3.14A", 3.14, 1);
-    ASSERT_LEX_NUMBER("1e9e", 1e9, 1);
+    for (int i = 0; i < sizeof(fail_cases) / sizeof(*fail_cases); ++i) {
+        StringView sv = sv_on_c_string(fail_cases[i]);
+        Token t;
+        const enum Error err = json_lex_next_number(&t, &sv);
+        assert(err == JSONE_PARSE_TOKEN_UNRECOGNIZED);
+    }
 }
-
-#define ASSERT_LEX_STRING(s, expected)                                       \
-    do {                                                                     \
-        StringView sv = sv_on_c_string(s);                                   \
-        Token t;                                                             \
-        enum Error err = json_lex_next_string(&arena, &t, &sv);              \
-        assert(err == OK);                                                   \
-        assert(t.kind == JSON_KIND_STRING);                                  \
-        assert(sv_equals(sv_on_string(t.string), sv_on_c_string(expected))); \
-    } while (0)
-
-#define ASSERT_LEX_STRING_FAIL(s, e)                            \
-    do {                                                        \
-        StringView sv = sv_on_c_string(s);                      \
-        Token t;                                                \
-        enum Error err = json_lex_next_string(&arena, &t, &sv); \
-        assert(e == err);                                       \
-    } while (0)
 
 static void test_json_lexer_strings() {
     Arena arena = arena_create(1024, 1);
 
-    ASSERT_LEX_STRING("\"hello\"", "hello");
-    ASSERT_LEX_STRING("\"0123456789\"", "0123456789");
-    ASSERT_LEX_STRING("\"π 歌 𝄞 ⁶🤷‍♂️⁷ 👨‍👩‍👧‍👦🏴󠁧󠁢󠁥󠁮󠁧󠁿\"",
-                      "π 歌 𝄞 ⁶🤷‍♂️⁷ 👨‍👩‍👧‍👦🏴󠁧󠁢󠁥󠁮󠁧󠁿");
-    ASSERT_LEX_STRING("\"\\\" \\\\ \\b \\f \\n \\r \\t \\/\"", "\" \\ \b \f \n \r \t /");
+    struct TestCaseSuccess {
+        char *string;
+        char *expected;
+    };
 
-    ASSERT_LEX_STRING_FAIL("\"hello", JSONE_PARSE_STRING_UNCLOSED);
-    ASSERT_LEX_STRING_FAIL("\"\\", JSONE_PARSE_BACKLASH_ESCAPE_INVALID);
-    ASSERT_LEX_STRING_FAIL("\"\\x\"", JSONE_PARSE_BACKLASH_ESCAPE_INVALID);
-    ASSERT_LEX_STRING_FAIL("\"\b\"", JSONE_PARSE_CONTROL_CHARACTER_UNESCAPED);
-    ASSERT_LEX_STRING_FAIL("\"\x1\"", JSONE_PARSE_CONTROL_CHARACTER_UNESCAPED);
+    const struct TestCaseSuccess success_cases[] = {
+        {"\"hello\"", "hello"},
+        {"\"0123456789\"", "0123456789"},
+        {"\"π 歌 𝄞 ⁶🤷‍♂️⁷ 👨‍👩‍👧‍👦🏴󠁧󠁢󠁥󠁮󠁧󠁿\"",
+         "π 歌 𝄞 ⁶🤷‍♂️⁷ 👨‍👩‍👧‍👦🏴󠁧󠁢󠁥󠁮󠁧󠁿"},
+        {"\"\\\" \\\\ \\b \\f \\n \\r \\t \\/\"", "\" \\ \b \f \n \r \t /"},
+    };
+
+    for (int i = 0; i < sizeof(success_cases) / sizeof(*success_cases); ++i) {
+        StringView sv = sv_on_c_string(success_cases[i].string);
+        Token t;
+        const enum Error err = json_lex_next_string(&arena, &t, &sv);
+        assert(err == OK);
+        assert(t.kind == JSON_KIND_STRING);
+        assert(sv_equals(sv_on_string(t.string), sv_on_c_string(success_cases[i].expected)));
+    }
+
+    struct TestCaseFail {
+        char *string;
+        enum Error expected;
+    };
+
+    const struct TestCaseFail fail_cases[] = {
+        {"\"hello", JSONE_PARSE_STRING_UNCLOSED},
+        {"\"\\", JSONE_PARSE_BACKLASH_ESCAPE_INVALID},
+        {"\"\\x\"", JSONE_PARSE_BACKLASH_ESCAPE_INVALID},
+        {"\"\b\"", JSONE_PARSE_CONTROL_CHARACTER_UNESCAPED},
+        {"\"\x1\"", JSONE_PARSE_CONTROL_CHARACTER_UNESCAPED},
+    };
+
+    for (int i = 0; i < sizeof(fail_cases) / sizeof(*fail_cases); ++i) {
+        StringView sv = sv_on_c_string(fail_cases[i].string);
+        Token t;
+        const enum Error err = json_lex_next_string(&arena, &t, &sv);
+        assert(fail_cases[i].expected == err);
+    }
 
     for (int i = 0; i < sizeof(INVALID_UTF_STRINGS) / sizeof(*INVALID_UTF_STRINGS); ++i) {
         StringBuilder sb = sb_create_and_borrow_arena(&arena);
@@ -1111,15 +1126,17 @@ static void test_json_lexer_strings() {
         sb_append_sv(&sb, sv_on_c_string((char *)INVALID_UTF_STRINGS[i]));
         sb_append_char(&sb, '"');
         sb_append_char(&sb, 0);
-        String s = sb_complete_and_release_arena(&sb);
-        ASSERT_LEX_STRING_FAIL(s.chars, JSONE_PARSE_UTF8_INVALID);
+        const String s = sb_complete_and_release_arena(&sb);
+        StringView sv = sv_on_string(s);
+        Token t;
+        const enum Error err = json_lex_next_string(&arena, &t, &sv);
+        assert(err == JSONE_PARSE_UTF8_INVALID);
     }
 
     arena_destroy(&arena);
 }
 
 int main(int argc, char *argv[]) {
-    setlocale(LC_CTYPE, "C.UTF-8");
     test_json_build_generate();
     test_json_generate_string_invalid();
 
@@ -1127,4 +1144,3 @@ int main(int argc, char *argv[]) {
     test_json_lexer_numbers();
     test_json_lexer_strings();
 }
-// Tape??
