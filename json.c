@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 // ==================== General macros ====================
 
@@ -23,7 +24,8 @@ enum Error {
     JSONE_GEN_NUM_INVALID,
     JSONE_GEN_DEPTH_LIMIT_EXCEEDED,
     JSONE_GEN_UTF8_INVALID,
-    JSONE_PARSE_TOKEN_UNRECOGNIZED,
+    JSONE_PARSE_CHARACTER_UNEXPECTED,
+    JSONE_PARSE_NUMBER_INVALID,
     JSONE_PARSE_STRING_UNCLOSED,
     JSONE_PARSE_BACKLASH_ESCAPE_INVALID,
     JSONE_PARSE_CONTROL_CHARACTER_UNESCAPED,
@@ -51,8 +53,10 @@ char *error_get_message(const enum Error err) {
             return "depth limit exceeded";
         case JSONE_GEN_UTF8_INVALID:
             return "invalid UTF8";
-        case JSONE_PARSE_TOKEN_UNRECOGNIZED:
+        case JSONE_PARSE_CHARACTER_UNEXPECTED:
             return "unexpected character";
+        case JSONE_PARSE_NUMBER_INVALID:
+            return "invalid number";
         case JSONE_PARSE_STRING_UNCLOSED:
             return "string is not closed";
         case JSONE_PARSE_BACKLASH_ESCAPE_INVALID:
@@ -66,7 +70,7 @@ char *error_get_message(const enum Error err) {
         case JSONE_PARSE_TOKEN_UNEXPECTED:
             return "unexpected token";
         case JSONE_PARSE_ARRAY_SEPARATOR_MISSING:
-            return "array elements must be separated by a','";
+            return "array elements must be separated by a ','";
         case JSONE_PARSE_OBJECT_SEPARATOR_MISSING:
             return "object members must be separated by a ','";
         case JSONE_PARSE_OBJECT_NAME_MISSING:
@@ -121,6 +125,8 @@ void arena_destroy(Arena *arena) {
     free(arena->data);
     *arena = (Arena){0};
 }
+
+void arena_clear(Arena *arena) { arena->used = 0; }
 
 void *arena_alloc(Arena *arena, const size_t size) {
     const size_t offset = align_up(arena->used, arena->alignment);
@@ -471,7 +477,7 @@ static enum Error json_lex_next_number(Token *token, StringView *sv) {
     while (1) {
         switch (state) {
             case START:
-                if (len == i) return JSONE_PARSE_TOKEN_UNRECOGNIZED;
+                if (len == i) return JSONE_PARSE_CHARACTER_UNEXPECTED;
                 if (isdigit(s[i])) {
                     if (s[i] != '0') {
                         state = LEADING_DIGIT;
@@ -481,11 +487,11 @@ static enum Error json_lex_next_number(Token *token, StringView *sv) {
                 } else if (s[i] == '-') {
                     state = AFTER_MINUS;
                 } else {
-                    return JSONE_PARSE_TOKEN_UNRECOGNIZED;
+                    return JSONE_PARSE_CHARACTER_UNEXPECTED;
                 }
                 break;
             case AFTER_MINUS:
-                if (len == i) return JSONE_PARSE_TOKEN_UNRECOGNIZED;
+                if (len == i) return JSONE_PARSE_CHARACTER_UNEXPECTED;
                 if (isdigit(s[i])) {
                     if (s[i] != '0') {
                         state = LEADING_DIGIT;
@@ -493,7 +499,7 @@ static enum Error json_lex_next_number(Token *token, StringView *sv) {
                         state = LEADING_ZERO;
                     }
                 } else {
-                    return JSONE_PARSE_TOKEN_UNRECOGNIZED;
+                    return JSONE_PARSE_CHARACTER_UNEXPECTED;
                 }
                 break;
             case LEADING_ZERO:
@@ -535,21 +541,21 @@ static enum Error json_lex_next_number(Token *token, StringView *sv) {
                 }
                 break;
             case EXPONENT:
-                if (len == i) return JSONE_PARSE_TOKEN_UNRECOGNIZED;
+                if (len == i) return JSONE_PARSE_CHARACTER_UNEXPECTED;
                 if (isdigit(s[i])) {
                     state = EXPONENT_DIGITS;
                 } else if (s[i] == '+' || s[i] == '-') {
                     state = EXPONENT_SIGN;
                 } else {
-                    return JSONE_PARSE_TOKEN_UNRECOGNIZED;
+                    return JSONE_PARSE_CHARACTER_UNEXPECTED;
                 }
                 break;
             case EXPONENT_SIGN:
-                if (len == i) return JSONE_PARSE_TOKEN_UNRECOGNIZED;
+                if (len == i) return JSONE_PARSE_CHARACTER_UNEXPECTED;
                 if (isdigit(s[i])) {
                     state = EXPONENT_DIGITS;
                 } else {
-                    return JSONE_PARSE_TOKEN_UNRECOGNIZED;
+                    return JSONE_PARSE_CHARACTER_UNEXPECTED;
                 }
                 break;
             case EXPONENT_DIGITS:
@@ -562,6 +568,7 @@ static enum Error json_lex_next_number(Token *token, StringView *sv) {
             case END: {
                 i--;
                 // Copy to buffer to use strtod which expects null-termination
+                if (i >= 60) return JSONE_PARSE_NUMBER_INVALID;
                 char buf[64] = {0};
                 memcpy(buf, sv->chars, i);
 
@@ -615,7 +622,7 @@ static uint32_t utf8_validate(uint32_t *state, const uint32_t byte) {
 }
 
 static enum Error json_lex_next_string(Arena *string_arena, Token *token, StringView *sv) {
-    if (*sv->chars != '"') return JSONE_PARSE_TOKEN_UNRECOGNIZED;
+    if (*sv->chars != '"') return JSONE_PARSE_CHARACTER_UNEXPECTED;
     sv_chop_left(sv, 1);
 
     enum Error err;
@@ -715,36 +722,35 @@ static enum Error json_lex_next_token(Arena *string_arena, Token *token, StringV
                 sv_chop_left(sv, 1);
                 return OK;
             case '"':
-                json_lex_next_string(string_arena, token, sv);
-                return OK;
+                return json_lex_next_string(string_arena, token, sv);
             case 't':
                 if (sv->length >= 4 && memcmp(sv->chars, "true", 4) == 0) {
                     *token = (Token){JSON_KIND_BOOLEAN, .boolean = true};
                     sv_chop_left(sv, 4);
                     return OK;
                 }
-                return JSONE_PARSE_TOKEN_UNRECOGNIZED;
+                return JSONE_PARSE_CHARACTER_UNEXPECTED;
             case 'f':
                 if (sv->length >= 5 && memcmp(sv->chars, "false", 5) == 0) {
                     *token = (Token){JSON_KIND_BOOLEAN, .boolean = false};
                     sv_chop_left(sv, 5);
                     return OK;
                 }
-                return JSONE_PARSE_TOKEN_UNRECOGNIZED;
+                return JSONE_PARSE_CHARACTER_UNEXPECTED;
             case 'n':
                 if (sv->length >= 4 && memcmp(sv->chars, "null", 4) == 0) {
                     *token = (Token){JSON_KIND_NULL};
                     sv_chop_left(sv, 4);
                     return OK;
                 }
-                return JSONE_PARSE_TOKEN_UNRECOGNIZED;
+                return JSONE_PARSE_CHARACTER_UNEXPECTED;
             default:
                 if (isspace(c)) {
                     sv_chop_left(sv, 1);
                 } else if (isdigit(c) || c == '-') {
                     return json_lex_next_number(token, sv);
                 } else {
-                    return JSONE_PARSE_TOKEN_UNRECOGNIZED;
+                    return JSONE_PARSE_CHARACTER_UNEXPECTED;
                 }
         }
     }
@@ -759,22 +765,9 @@ static const int JSON_DEPTH_LIMIT = 32;
 
 typedef struct JsonParserState {
     JsonArena *arena;
-    StringView *error_message;
     StringView *json_sv;
     const size_t json_length;
 } JsonParserState;
-
-static enum Error json_parser_handle_error(const JsonParserState parser, const enum Error err) {
-    TRY(sv_create_formatted(&parser.arena->strings, parser.error_message, "Invalid JSON at byte %zu: %s",
-                            parser.json_length - parser.json_sv->length, error_get_message(err)));
-    return err;
-}
-
-static enum Error json_parser_consume(const JsonParserState parser, Token *token) {
-    const enum Error err = json_lex_next_token(&parser.arena->strings, token, parser.json_sv);
-    if (err != OK) return json_parser_handle_error(parser, err);
-    return OK;
-}
 
 static enum Error json_parse_value(const JsonParserState parser, JsonValue *result, const Token *value_token,
                                    const int depth) {
@@ -782,60 +775,66 @@ static enum Error json_parse_value(const JsonParserState parser, JsonValue *resu
     switch (value_token->kind) {
         case JSON_KIND_BEGIN_ARRAY: {
             JsonArray array = {0};
+            bool first = true;
             while (1) {
                 Token element_token;
-                TRY(json_parser_consume(parser, &element_token));
+                TRY(json_lex_next_token(&parser.arena->strings, &element_token, parser.json_sv));
 
-                // Empty array
-                if (element_token.kind == JSON_KIND_END_ARRAY) break;
+                if (element_token.kind == JSON_KIND_END_ARRAY) {
+                    // Empty array
+                    if (first) break;
+                    return JSONE_PARSE_TOKEN_UNEXPECTED;
+                }
+                first = false;
 
                 JsonValue element_value;
                 TRY(json_parse_value(parser, &element_value, &element_token, depth + 1));
-                json_array_append(parser.arena, &array, element_value);
+                TRY(json_array_append(parser.arena, &array, element_value));
 
                 Token seperator_token;
-                TRY(json_parser_consume(parser, &seperator_token));
+                TRY(json_lex_next_token(&parser.arena->strings, &seperator_token, parser.json_sv));
 
                 if (seperator_token.kind == JSON_KIND_END_ARRAY) break;
-                if (seperator_token.kind != JSON_KIND_VALUE_SEPARATOR) {
-                    return json_parser_handle_error(parser, JSONE_PARSE_ARRAY_SEPARATOR_MISSING);
-                }
+                if (seperator_token.kind != JSON_KIND_VALUE_SEPARATOR) { return JSONE_PARSE_ARRAY_SEPARATOR_MISSING; }
             }
             *result = json_array(array);
             break;
         }
         case JSON_KIND_BEGIN_OBJECT: {
             JsonObject object = {0};
+            bool first = true;
             while (1) {
                 Token name_token;
-                TRY(json_parser_consume(parser, &name_token));
+                TRY(json_lex_next_token(&parser.arena->strings, &name_token, parser.json_sv));
 
-                // Empty object
-                if (name_token.kind == JSON_KIND_END_OBJECT) break;
-
-                if (name_token.kind != JSON_KIND_STRING) {
-                    return json_parser_handle_error(parser, JSONE_PARSE_OBJECT_NAME_MISSING);
+                if (name_token.kind == JSON_KIND_END_OBJECT) {
+                    // Empty object
+                    if (first) break;
+                    return JSONE_PARSE_TOKEN_UNEXPECTED;
                 }
+                first = false;
+
+                if (name_token.kind != JSON_KIND_STRING) { return JSONE_PARSE_OBJECT_NAME_MISSING; }
 
                 Token name_seperator_token;
-                TRY(json_parser_consume(parser, &name_seperator_token));
+                TRY(json_lex_next_token(&parser.arena->strings, &name_seperator_token, parser.json_sv));
                 if (name_seperator_token.kind != JSON_KIND_NAME_SEPARATOR) {
-                    return json_parser_handle_error(parser, JSONE_PARSE_NAME_SEPARATOR_MISSING);
+                    return JSONE_PARSE_NAME_SEPARATOR_MISSING;
                 }
 
                 Token member_token;
-                TRY(json_parser_consume(parser, &member_token));
+                TRY(json_lex_next_token(&parser.arena->strings, &member_token, parser.json_sv));
 
                 JsonValue member_value;
                 TRY(json_parse_value(parser, &member_value, &member_token, depth + 1));
-                json_object_add_member(parser.arena, &object, name_token.string, member_value);
+                TRY(json_object_add_member(parser.arena, &object, name_token.string, member_value));
 
                 Token value_seperator_token;
-                TRY(json_parser_consume(parser, &value_seperator_token));
+                TRY(json_lex_next_token(&parser.arena->strings, &value_seperator_token, parser.json_sv));
 
                 if (value_seperator_token.kind == JSON_KIND_END_OBJECT) break;
                 if (value_seperator_token.kind != JSON_KIND_VALUE_SEPARATOR) {
-                    return json_parser_handle_error(parser, JSONE_PARSE_OBJECT_SEPARATOR_MISSING);
+                    return JSONE_PARSE_OBJECT_SEPARATOR_MISSING;
                 }
             }
             *result = json_object(object);
@@ -854,21 +853,36 @@ static enum Error json_parse_value(const JsonParserState parser, JsonValue *resu
             *result = json_null();
             break;
         default:
-            return json_parser_handle_error(parser, JSONE_PARSE_TOKEN_UNEXPECTED);
+            return JSONE_PARSE_TOKEN_UNEXPECTED;
     }
     return OK;
 }
 
-enum Error json_parse(JsonArena *arena, JsonValue **result, StringView *error_message, StringView *json_sv) {
-    const JsonParserState parser = {arena, error_message, json_sv, json_sv->length};
+static enum Error json_parser_handle_error(const JsonParserState parser, StringView *error_message,
+                                           const enum Error err) {
+    if (error_message) {
+        TRY(sv_create_formatted(&parser.arena->strings, error_message, "Error parsing JSON at byte %zu: %s",
+                                parser.json_length - parser.json_sv->length, error_get_message(err)));
+    }
+    return err;
+}
+
+enum Error json_parse(JsonArena *arena, JsonValue **result, StringView *error_message, StringView json_sv) {
+    const JsonParserState parser = {arena, &json_sv, json_sv.length};
 
     Token token;
-    TRY(json_parser_consume(parser, &token));
+    {
+        const enum Error err = json_lex_next_token(&parser.arena->strings, &token, parser.json_sv);
+        if (err != OK) return json_parser_handle_error(parser, error_message, err);
+    }
 
     JsonValue *v = arena_alloc(&arena->structure, sizeof(JsonValue));
     if (!v) return ARENA_FULL;
 
-    TRY(json_parse_value(parser, v, &token, 0));
+    {
+        const enum Error err = json_parse_value(parser, v, &token, 0);
+        if (err != OK) return json_parser_handle_error(parser, error_message, err);
+    }
 
     *result = v;
     return OK;
@@ -1032,6 +1046,53 @@ enum Error json_generate(StringBuilder *sb, const JsonValue *value) { return jso
 
 enum Error json_generate_pretty(StringBuilder *sb, const JsonValue *value, const int pretty_width) {
     return json_generate_inner(sb, value, pretty_width, 0);
+}
+
+// ==================== Miscellaneous ====================
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+typedef struct MemMapFile {
+    int fd;
+    size_t file_size;
+    char *data;
+} MemMapFile;
+
+MemMapFile open_mem_map_file(const char *path) {
+    const int fd = open(path, O_RDONLY);
+    if (fd == -1) { return (MemMapFile){0}; }
+
+    struct stat st;
+    if (fstat(fd, &st) == -1) {
+        close(fd);
+        return (MemMapFile){0};
+    }
+
+    const size_t fileSize = (size_t)st.st_size;
+
+    char *data = mmap(NULL, fileSize, PROT_READ, MAP_PRIVATE, fd, 0);
+
+    if (data == MAP_FAILED) {
+        close(fd);
+        return (MemMapFile){0};
+    }
+
+    return (MemMapFile){fd, fileSize, data};
+}
+
+void close_mem_map_file(const MemMapFile file) {
+    munmap(file.data, file.file_size);
+    close(file.fd);
+}
+
+double get_time() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
 // ==================== Tests ====================
@@ -1283,7 +1344,7 @@ static void test_json_lexer_numbers() {
         StringView sv = sv_on_c_string(fail_cases[i]);
         Token t;
         const enum Error err = json_lex_next_number(&t, &sv);
-        assert(err == JSONE_PARSE_TOKEN_UNRECOGNIZED);
+        assert(err == JSONE_PARSE_CHARACTER_UNEXPECTED);
     }
 }
 
@@ -1360,34 +1421,34 @@ static void test_json_parse() {
 
     {
         StringView test_string = sv_on_c_string("true");
-        const enum Error err = json_parse(&arena, &v, &error_message, &test_string);
+        const enum Error err = json_parse(&arena, &v, &error_message, test_string);
         assert(err == OK);
         assert(v->type == JSON_BOOLEAN);
         assert(v->boolean == true);
     }
     {
         StringView test_string = sv_on_c_string("\t null");
-        const enum Error err = json_parse(&arena, &v, &error_message, &test_string);
+        const enum Error err = json_parse(&arena, &v, &error_message, test_string);
         assert(err == OK);
         assert(v->type == JSON_NULL);
     }
     {
         StringView test_string = sv_on_c_string("\n   67  ");
-        const enum Error err = json_parse(&arena, &v, &error_message, &test_string);
+        const enum Error err = json_parse(&arena, &v, &error_message, test_string);
         assert(err == OK);
         assert(v->type == JSON_NUMBER);
         assert(v->number == 67);
     }
     {
         StringView test_string = sv_on_c_string("\"hello \"");
-        const enum Error err = json_parse(&arena, &v, &error_message, &test_string);
+        const enum Error err = json_parse(&arena, &v, &error_message, test_string);
         assert(err == OK);
         assert(v->type == JSON_STRING);
         assert(sv_equals(v->string, sv_on_c_string("hello ")));
     }
     {
         StringView test_string = sv_on_c_string(STR([ 1, false, [], [[[[["hello"]]]]] ]));
-        const enum Error err = json_parse(&arena, &v, &error_message, &test_string);
+        const enum Error err = json_parse(&arena, &v, &error_message, test_string);
         assert(err == OK);
         assert(v->type == JSON_ARRAY);
 
@@ -1398,7 +1459,7 @@ static void test_json_parse() {
     }
     {
         StringView test_string = sv_on_c_string("[ ]");
-        const enum Error err = json_parse(&arena, &v, &error_message, &test_string);
+        const enum Error err = json_parse(&arena, &v, &error_message, test_string);
         assert(err == OK);
         assert(v->type == JSON_ARRAY);
 
@@ -1410,7 +1471,7 @@ static void test_json_parse() {
     {
         StringView test_string = sv_on_c_string(STR(
             {"hello" : "world", "object" : {"nested" : 1}, "empty" : {}, "more nested" : {"" : {"" : [ {}, 67 ]}}}));
-        const enum Error err = json_parse(&arena, &v, &error_message, &test_string);
+        const enum Error err = json_parse(&arena, &v, &error_message, test_string);
         assert(err == OK);
         assert(v->type == JSON_OBJECT);
 
@@ -1424,7 +1485,7 @@ static void test_json_parse() {
     }
     {
         StringView test_string = sv_on_c_string(TEST_JSON_STRING);
-        const enum Error err = json_parse(&arena, &v, &error_message, &test_string);
+        const enum Error err = json_parse(&arena, &v, &error_message, test_string);
         if (err != OK) {
             assert(error_message.length > 0);
             LOG_ERROR(SV_FMT, SV_ARG(error_message));
@@ -1437,19 +1498,108 @@ static void test_json_parse() {
         assert(sv_equals(sv_on_c_string(TEST_JSON_STRING), output_string));
     }
     {
-        StringView test_string =
-            sv_on_c_string("[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]");
-        const enum Error err = json_parse(&arena, &v, &error_message, &test_string);
+        StringView test_string = sv_on_c_string("[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]");
+        const enum Error err = json_parse(&arena, &v, &error_message, test_string);
         assert(err == OK);
-    }
-    {
-        StringView test_string =
-            sv_on_c_string("[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]");
-        const enum Error err = json_parse(&arena, &v, &error_message, &test_string);
-        assert(err == JSONE_PARSE_DEPTH_LIMIT_EXCEEDED);
     }
 
     json_arena_destroy(&arena);
+}
+
+static void test_json_parse_errors() {
+    JsonArena arena;
+    json_arena_create(&arena, 1024 * 1024, 1024 * 1024);
+
+    JsonValue *v;
+    StringView error_message = {0};
+    enum Error err = 0;
+
+    struct TestCase {
+        char *input;
+        enum Error expected_error;
+    };
+
+    const struct TestCase cases[] = {
+        {"[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]",
+         JSONE_PARSE_DEPTH_LIMIT_EXCEEDED},
+        {"invalid", JSONE_PARSE_CHARACTER_UNEXPECTED},
+        {"[1 2]", JSONE_PARSE_ARRAY_SEPARATOR_MISSING},
+        {"[}]", JSONE_PARSE_TOKEN_UNEXPECTED},
+        {"[1,2,]", JSONE_PARSE_TOKEN_UNEXPECTED},
+        {"[1,2,3[", JSONE_PARSE_ARRAY_SEPARATOR_MISSING},
+        {STR({"a" : 1 "b" : 2}), JSONE_PARSE_OBJECT_SEPARATOR_MISSING},
+        {"{]}", JSONE_PARSE_OBJECT_NAME_MISSING},
+        {STR({
+             "a" : 1,
+             "b" : 2,
+         }),
+         JSONE_PARSE_TOKEN_UNEXPECTED},
+        {STR({"a" 1}), JSONE_PARSE_NAME_SEPARATOR_MISSING}};
+
+    for (int i = 0; i < sizeof(cases) / sizeof(struct TestCase); ++i) {
+        error_message.length = 0;
+        const StringView sv = sv_on_c_string(cases[i].input);
+        err = json_parse(&arena, &v, &error_message, sv);
+        if (err != cases[i].expected_error) {
+            LOG_ERROR(SV_FMT " " SV_FMT, SV_ARG(sv), SV_ARG(error_message));
+            assert(err == cases[i].expected_error);
+        }
+    }
+
+    json_arena_destroy(&arena);
+}
+
+static int count_json_objects(const JsonValue v) {
+    switch (v.type) {
+        case JSON_OBJECT: {
+            int sum = 0;
+            for (int i = 0; i < v.object.count; ++i) { sum += count_json_objects(v.object.members[i].value); }
+            return sum + 1;
+        }
+        case JSON_ARRAY: {
+            int sum = 0;
+            for (int i = 0; i < v.array.count; ++i) { sum += count_json_objects(v.array.elements[i]); }
+            return sum;
+        }
+        default:
+            return 0;
+    }
+}
+
+// ReSharper disable once CppDFAConstantParameter
+static void test_json_parse_twitter(const int test_runs) {
+    const MemMapFile file = open_mem_map_file("../test_files/twitter.json");
+    assert(file.data);
+
+    JsonArena arena;
+    json_arena_create(&arena, 2 * 1024 * 1024, 1024 * 1024);
+
+    JsonValue *json_value;
+    StringView error_message = {0};
+
+    const double start = get_time();
+
+    for (int i = 0; i < test_runs; ++i) {
+        const enum Error err = json_parse(&arena, &json_value, &error_message, (StringView){file.file_size, file.data});
+        LOG_INFO("Arena used %zu + %zu = %zu bytes", arena.structure.used, arena.strings.used,
+                 arena.structure.used + arena.strings.used);
+        if (err != OK) {
+            LOG_ERROR(SV_FMT, SV_ARG(error_message));
+            assert(0);
+        }
+        arena_clear(&arena.structure);
+        arena_clear(&arena.strings);
+    }
+
+    // ReSharper disable once CppDFAConstantConditions
+    if (test_runs > 1) {
+        // 0.8 ms
+        LOG_INFO("Parsed %zu bytes in average of %f ms", file.file_size, 1000 * (get_time() - start) / test_runs);
+    }
+
+    assert(count_json_objects(*json_value) == 1264);
+
+    close_mem_map_file(file);
 }
 
 int main(int argc, char *argv[]) {
@@ -1461,10 +1611,12 @@ int main(int argc, char *argv[]) {
     test_json_lexer_strings();
 
     test_json_parse();
+    test_json_parse_errors();
+    test_json_parse_twitter(1);
 }
 
-// TODO parsing fail tests
 // TODO accept all valid hex codes
+// TODO integer number types
 // TODO null pointer handling?
 
 // Valid code points: 0x0000 <= cp <= 0xD7FF and 0xE000 <= cp <= 0x10FFFF
