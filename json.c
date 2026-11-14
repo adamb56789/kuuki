@@ -99,6 +99,15 @@ char *error_get_message(const enum Error err) {
         goto defer; \
     } while (0)
 
+#define TRY_OR_DEFER(expr)                                         \
+    do {                                                           \
+        err = (expr);                                              \
+        if (err != OK) {                                           \
+            LOG_WARN("Error %d: %s", err, error_get_message(err)); \
+            goto defer;                                            \
+        }                                                          \
+    } while (0)
+
 // ==================== Allocators ====================
 
 typedef struct {
@@ -621,8 +630,30 @@ static uint32_t utf8_validate(uint32_t *state, const uint32_t byte) {
     return *state;
 }
 
+static enum Error convert_four_hex_digits(uint16_t *dest, const StringView sv) {
+    assert(sv.length == 4);
+
+    uint16_t sum = 0;
+    for (int i = 0; i < 4; ++i) {
+        sum *= 16;
+
+        const char c = sv.chars[i];
+        if ('0' <= c && c <= '9') {
+            sum += c - '0';
+        } else if ('A' <= c && c <= 'F') {
+            sum += c - 'A' + 10;
+        } else if ('a' <= c && c <= 'f') {
+            sum += c - 'a' + 10;
+        } else {
+            return JSONE_PARSE_HEX_ESCAPE_INVALID;
+        }
+    }
+    *dest = sum;
+    return OK;
+}
+
 static enum Error json_lex_next_string(Arena *string_arena, Token *token, StringView *sv) {
-    if (*sv->chars != '"') return JSONE_PARSE_CHARACTER_UNEXPECTED;
+    if (sv->length < 0 || *sv->chars != '"') return JSONE_PARSE_CHARACTER_UNEXPECTED;
     sv_chop_left(sv, 1);
 
     enum Error err;
@@ -635,7 +666,7 @@ static enum Error json_lex_next_string(Arena *string_arena, Token *token, String
             const StringView string = sb_complete_and_release_arena(&sb);
             *token = (Token){JSON_KIND_STRING, .string = string};
 
-            DEFER(OK);
+            return OK;
         }
 
         if (*sv->chars == '\\') {
@@ -645,31 +676,66 @@ static enum Error json_lex_next_string(Arena *string_arena, Token *token, String
             if (sv->chars[1] == 'u') {
                 if (sv->length < 6) DEFER(JSONE_PARSE_HEX_ESCAPE_INVALID);
 
-                for (int i = 2; i < 6; ++i) {
-                    if (!isxdigit(sv->chars[i])) DEFER(JSONE_PARSE_HEX_ESCAPE_INVALID);
+                uint16_t n;
+                TRY_OR_DEFER(convert_four_hex_digits(&n, (StringView){4, sv->chars + 2}));
+
+                // https://www.rfc-editor.org/info/rfc8259/#section-8.2 notes that the spec allows 'bit sequences that
+                // cannot encode Unicode characters; for example, "\uDEAD" (a single unpaired UTF-16 surrogate)'
+                // I've decided to reject invalid characters instead so they don't cause problems elsewhere.
+
+                // UTF-16 low surrogate without a preceding high surrogate
+                if (0xDC00 <= n && n <= 0xDFFF) DEFER(JSONE_PARSE_HEX_ESCAPE_INVALID);
+
+                uint32_t code_point;
+                int consumed_characters = 6;
+                if (0xD800 <= n && n <= 0xDBFF) {  // UTF-16 high surrogate, MUST be followed by low surrogate
+                    consumed_characters += 6;
+                    if (sv->length < 12 || sv->chars[6] != '\\' || sv->chars[7] != 'u')
+                        DEFER(JSONE_PARSE_HEX_ESCAPE_INVALID);
+
+                    uint16_t low_surrogate;
+                    TRY_OR_DEFER(convert_four_hex_digits(&low_surrogate, (StringView){4, sv->chars + 8}));
+
+                    if (low_surrogate < 0xDC00 || 0xDFFF < low_surrogate) DEFER(JSONE_PARSE_HEX_ESCAPE_INVALID);
+
+                    code_point = 0x10000 + (((n - 0xD800) << 10) | (low_surrogate - 0xDC00));
+                } else {  // Not a surrogate so must be a single code point
+                    code_point = n;
                 }
 
-                char buf[5] = {0};
-                memcpy(buf, sv->chars + 2, 4);
-                const long n = strtol(buf, NULL, 16);
+                if (code_point <= 0x007f) {
+                    TRY_OR_DEFER(sb_append_char(&sb, code_point));
+                } else if (code_point <= 0x07FF) {
+                    TRY_OR_DEFER(sb_append_char(&sb, 0b11000000 | ((code_point >> 6) & 0b00011111)));
+                    TRY_OR_DEFER(sb_append_char(&sb, 0b10000000 | (code_point & 0b00111111)));
+                } else if (code_point <= 0xFFFF) {
+                    TRY_OR_DEFER(sb_append_char(&sb, 0b11100000 | ((code_point >> 12) & 0b00001111)));
+                    TRY_OR_DEFER(sb_append_char(&sb, 0b10000000 | ((code_point >> 6) & 0b00111111)));
+                    TRY_OR_DEFER(sb_append_char(&sb, 0b10000000 | (code_point & 0b00111111)));
+                } else if (code_point <= 0x10FFFF) {
+                    TRY_OR_DEFER(sb_append_char(&sb, 0b11110000 | ((code_point >> 18) & 0b00000111)));
+                    TRY_OR_DEFER(sb_append_char(&sb, 0b10000000 | ((code_point >> 12) & 0b00111111)));
+                    TRY_OR_DEFER(sb_append_char(&sb, 0b10000000 | ((code_point >> 6) & 0b00111111)));
+                    TRY_OR_DEFER(sb_append_char(&sb, 0b10000000 | (code_point & 0b00111111)));
+                } else {
+                    LOG_ERROR("This should be unreachable i messed up utf-8");
+                    assert(0);
+                }
 
-                if (n < 0 || n >= 32) DEFER(JSONE_PARSE_HEX_ESCAPE_INVALID);
-
-                TRY(sb_append_char(&sb, n));
-                sv_chop_left(sv, 6);
+                sv_chop_left(sv, consumed_characters);
             } else {
                 // Valid escapes are "\bfnrt/
-                const char c = PARSE_BACKSLASH_ESCAPE_MAP[sv->chars[1]];
+                const unsigned char c = PARSE_BACKSLASH_ESCAPE_MAP[sv->chars[1]];
                 if (c == 0) DEFER(JSONE_PARSE_BACKLASH_ESCAPE_INVALID);
 
-                TRY(sb_append_char(&sb, c));
+                TRY_OR_DEFER(sb_append_char(&sb, c));
                 sv_chop_left(sv, 2);
             }
         } else if ((uint8_t)*sv->chars < 128) {
             // Control characters must be escaped and cannot be directly in strings
             if (*sv->chars < 32) DEFER(JSONE_PARSE_CONTROL_CHARACTER_UNESCAPED);
 
-            TRY(sb_append_char(&sb, *sv->chars));
+            TRY_OR_DEFER(sb_append_char(&sb, *sv->chars));
             sv_chop_left(sv, 1);
         } else {
             const uint8_t *s = (uint8_t *)sv->chars;
@@ -680,7 +746,7 @@ static enum Error json_lex_next_string(Arena *string_arena, Token *token, String
             }
 
             if (state == 0) {  // OK
-                TRY(sb_append_sv(&sb, (StringView){length, sv->chars}));
+                TRY_OR_DEFER(sb_append_sv(&sb, (StringView){length, sv->chars}));
                 sv_chop_left(sv, length);
             } else {
                 DEFER(JSONE_PARSE_UTF8_INVALID);
@@ -1363,15 +1429,40 @@ static void test_json_lexer_strings() {
          "π 歌 𝄞 ⁶🤷‍♂️⁷ 👨‍👩‍👧‍👦🏴󠁧󠁢󠁥󠁮󠁧󠁿"},
         {"\"\\\" \\\\ \\b \\f \\n \\r \\t \\/\"", "\" \\ \b \f \n \r \t /"},
         {"\"\\u0001\"", "\1"},
+        {"\"\\u0041\"", "A"},
+        {"\"\\u03C0\"", "π"},
+        {"\"\\u6B4C\"", "歌"},
+        {"\"\\uD834\\uDD1E\"", "𝄞"},
+        {"\"\\uD840\\uDC00\"", "𠀀"},
+        {"\"\\u0041\\uD834\\uDD1E\\u6B4C\"", "A𝄞歌"},
+        // UTF-8 encoding boundaries
+        {"\"\\u007F\"", "\x7F"},
+        {"\"\\u0080\"", "\xC2\x80"},
+        {"\"\\u07FF\"", "\xDF\xBF"},
+        {"\"\\u0800\"", "\xE0\xA0\x80"},
+        {"\"\\uFFFF\"", "\xEF\xBF\xBF"},
+        // Four-byte UTF-8 leading-byte boundaries
+        {"\"\\uD800\\uDC00\"", "\xF0\x90\x80\x80"},  // U+10000
+        {"\"\\uD8C0\\uDC00\"", "\xF1\x80\x80\x80"},  // U+40000
+        {"\"\\uD9C0\\uDC00\"", "\xF2\x80\x80\x80"},  // U+80000
+        {"\"\\uDAC0\\uDC00\"", "\xF3\x80\x80\x80"},  // U+C0000
+        {"\"\\uDBC0\\uDC00\"", "\xF4\x80\x80\x80"},  // U+100000
+        {"\"\\uDBFF\\uDFFF\"", "\xF4\x8F\xBF\xBF"},  // U+10FFFF
     };
 
     for (int i = 0; i < sizeof(success_cases) / sizeof(*success_cases); ++i) {
         StringView sv = sv_on_c_string(success_cases[i].string);
         Token t;
         const enum Error err = json_lex_next_string(&arena, &t, &sv);
-        assert(err == OK);
+        if (err != OK) {
+            LOG_ERROR(SV_FMT ": %s", SV_ARG(sv), error_get_message(err));
+            assert(err == OK);
+        }
         assert(t.kind == JSON_KIND_STRING);
-        assert(sv_equals(t.string, sv_on_c_string(success_cases[i].expected)));
+        if (!sv_equals(t.string, sv_on_c_string(success_cases[i].expected))) {
+            LOG_ERROR("Expected %s but was " SV_FMT, success_cases[i].expected, SV_ARG(t.string));
+            assert(0);
+        }
     }
 
     struct TestCaseFail {
@@ -1385,16 +1476,30 @@ static void test_json_lexer_strings() {
         {"\"\\x\"", JSONE_PARSE_BACKLASH_ESCAPE_INVALID},
         {"\"\b\"", JSONE_PARSE_CONTROL_CHARACTER_UNESCAPED},
         {"\"\x1\"", JSONE_PARSE_CONTROL_CHARACTER_UNESCAPED},
-        {"\"\\u0020\"", JSONE_PARSE_HEX_ESCAPE_INVALID},
         {"\"\\u001\"", JSONE_PARSE_HEX_ESCAPE_INVALID},
         {"\"\\ua\"", JSONE_PARSE_HEX_ESCAPE_INVALID},
+        {"\"\\u12G4\"", JSONE_PARSE_HEX_ESCAPE_INVALID},
+        {"\"\\uD834\"", JSONE_PARSE_HEX_ESCAPE_INVALID},         // isolated high surrogate
+        {"\"\\uDD1E\"", JSONE_PARSE_HEX_ESCAPE_INVALID},         // isolated low surrogate
+        {"\"\\uDD1E\\uD834\"", JSONE_PARSE_HEX_ESCAPE_INVALID},  // high surrogate after low surrogate
+        // high surrogate followed hex escape which is not low surrogate
+        {"\"\\uD834\\u0000\"", JSONE_PARSE_HEX_ESCAPE_INVALID},
+        // high surrogates followed by invalid escapes
+        {"\"\\uD800\\u12G4\"", JSONE_PARSE_HEX_ESCAPE_INVALID},
+        {"\"\\uD800x\"", JSONE_PARSE_HEX_ESCAPE_INVALID},
+        {"\"\\uD800\\\\n\"", JSONE_PARSE_HEX_ESCAPE_INVALID},
+
     };
 
     for (int i = 0; i < sizeof(fail_cases) / sizeof(*fail_cases); ++i) {
         StringView sv = sv_on_c_string(fail_cases[i].string);
         Token t;
         const enum Error err = json_lex_next_string(&arena, &t, &sv);
-        assert(fail_cases[i].expected == err);
+        if (fail_cases[i].expected != err) {
+            LOG_ERROR("For string %s expected '%s' but got %s", fail_cases[i].string,
+                      error_get_message(fail_cases[i].expected), error_get_message(err));
+            assert(0);
+        }
     }
 
     for (int i = 0; i < sizeof(INVALID_UTF_STRINGS) / sizeof(*INVALID_UTF_STRINGS); ++i) {
@@ -1581,8 +1686,6 @@ static void test_json_parse_twitter(const int test_runs) {
 
     for (int i = 0; i < test_runs; ++i) {
         const enum Error err = json_parse(&arena, &json_value, &error_message, (StringView){file.file_size, file.data});
-        LOG_INFO("Arena used %zu + %zu = %zu bytes", arena.structure.used, arena.strings.used,
-                 arena.structure.used + arena.strings.used);
         if (err != OK) {
             LOG_ERROR(SV_FMT, SV_ARG(error_message));
             assert(0);
@@ -1593,11 +1696,14 @@ static void test_json_parse_twitter(const int test_runs) {
 
     // ReSharper disable once CppDFAConstantConditions
     if (test_runs > 1) {
-        // 0.8 ms
+        // 0.75 ms
         LOG_INFO("Parsed %zu bytes in average of %f ms", file.file_size, 1000 * (get_time() - start) / test_runs);
     }
 
     assert(count_json_objects(*json_value) == 1264);
+
+    LOG_INFO("Arena used %zu + %zu = %zu bytes", arena.structure.used, arena.strings.used,
+                 arena.structure.used + arena.strings.used);
 
     close_mem_map_file(file);
 }
@@ -1615,8 +1721,5 @@ int main(int argc, char *argv[]) {
     test_json_parse_twitter(1);
 }
 
-// TODO accept all valid hex codes
 // TODO integer number types
 // TODO null pointer handling?
-
-// Valid code points: 0x0000 <= cp <= 0xD7FF and 0xE000 <= cp <= 0x10FFFF
