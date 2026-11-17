@@ -5,8 +5,9 @@ set(CMAKE_C_STANDARD 11)
 
 string(APPEND CMAKE_C_FLAGS_RELEASE " -march=native -g")
 
-add_executable(json json.c)
-target_link_libraries(json PRIVATE m)
+add_executable(ds_tests ds.h tests/ds_tests.c)
+
+add_executable(json json.h tests/json_tests.c)
 target_compile_options(json PRIVATE
         -Werror=attribute-warning
         -Werror=format

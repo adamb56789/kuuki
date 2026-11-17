@@ -2,6 +2,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define DS_IMPLEMENTATION
+#include "ds.h"
+#define JSON_IMPLEMENTATION
+#include "json.h"
+
 // The type-checking on curl_easy_setopt and similar expands to huge macros
 // which times out the analyzer, messes up the syntax highlighting, and somehow
 // started randomly deleting and moving lines of code?
@@ -22,8 +27,6 @@ typedef int64_t i64;
 
 #define LATENCY_LOG_ENABLE
 // #define CURL_DEBUG
-
-#define STR(...) #__VA_ARGS__
 
 #define LOG_DEBUG(fmt, ...) fprintf(stderr, "[DEBUG] %s:%d: " fmt "\n", __FILE_NAME__, __LINE__, ##__VA_ARGS__)
 #define LOG_INFO(fmt, ...) fprintf(stderr, "[INFO] %s:%d: " fmt "\n", __FILE_NAME__, __LINE__, ##__VA_ARGS__)
@@ -47,11 +50,11 @@ static const char *DYNAMODB_ENDPOINT = "https://dynamodb." AWS_REGION ".amazonaw
 #define X_AMZ_TARGET_DYNAMODB X_AMZ_TARGET_PREFIX "DynamoDB_20120810."
 static const char *DYNAMODB_QUERY = X_AMZ_TARGET_DYNAMODB "Query";
 
-static const char *ACCESS_DENIED_RESPONSE = STR({"statusCode" : 403, "body" : "Access denied"});
+static const char *ACCESS_DENIED_RESPONSE = JSON_STR({"statusCode" : 403, "body" : "Access denied"});
 
 // TODO encode in HTML <link rel="icon"
 // href="data:image/x-icon;base64,AAABAAEAEBAAAAAAAABoBQAAF/QA6OjoAKysrABwcH"/>
-static const char *FAVICON = STR({
+static const char *FAVICON = JSON_STR({
     "statusCode" : 200,
     "body" : "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"12\" height=\"12\">"
              "<text x=\"0\" y=\"10\" font-size=\"12\">気</text>"
@@ -216,7 +219,7 @@ typedef struct {
 } Measurement;
 
 int query(const HttpClient *client, Measurement *measurement) {
-    char *input = STR({
+    char *input = JSON_STR({
         "TableName" : "MeasurementsTable",
         "Limit" : 1,
         "KeyConditionExpression" : "device_id = :d",
@@ -230,6 +233,23 @@ int query(const HttpClient *client, Measurement *measurement) {
         LOG_ERROR("Query returned code %d: %.*s", code, (int)response.length, response.data);
         return 1;
     }
+
+    JsonArena json_arena;
+    json_arena_create(&json_arena, 2024, 1024);
+    JsonValue *root;
+    StringView json_err_msg;
+    const enum JsonError json_err =
+        json_parse(&json_arena, &root, &json_err_msg, (StringView){response.length, response.data});
+
+    if (json_err != JSON_OK) {
+        LOG_ERROR(SV_FMT, SV_ARG(json_err_msg));
+        return 1;
+    }
+
+    JsonObject item = json_get_array_s(&root->object, "Items")->items[0].object;
+    // TODO concert stringview to cstr for functions like strtof
+    // TODO better json arena creation
+    // TODO make this lambda properly
 
     char *humidity = strstr(response.data, "humidity");
     char *temperature = strstr(response.data, "temperature");
@@ -294,7 +314,7 @@ int main(int argc, char *argv[]) {
             Measurement measurement;
             query(&client, &measurement);
 
-            snprintf(response_data, sizeof(response_data), STR({"humidity" : "%.1f", "temperature" : "%.1f"}),
+            snprintf(response_data, sizeof(response_data), JSON_STR({"humidity" : "%.1f", "temperature" : "%.1f"}),
                      measurement.humidity, measurement.temperature);
         }
 
